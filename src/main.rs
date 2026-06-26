@@ -44,12 +44,7 @@ const SERVICE: &str = "fiducia-load-balance";
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    fiducia_telemetry::init(SERVICE);
 
     let shard_count: u32 = std::env::var("FIDUCIA_SHARD_COUNT")
         .ok()
