@@ -13,6 +13,9 @@ tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Shared OpenTelemetry + tracing setup (one init() for all services).
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
+
 # Shared key→shard routing — single source of truth (see fiducia-routing.rs).
 # Local dev uses a path dep; in CI/deployment switch to a git dep, e.g.:
 #   fiducia-routing = { git = "https://github.com/fiducia-cloud/fiducia-routing.rs", tag = "v0.1.0" }
