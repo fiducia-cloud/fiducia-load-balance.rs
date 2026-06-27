@@ -197,10 +197,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fiducia-interfaces"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fiducia-load-balance"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fiducia-interfaces",
  "fiducia-routing",
  "fiducia-telemetry",
  "reqwest",
@@ -215,6 +224,9 @@ dependencies = [
 [[package]]
 name = "fiducia-routing"
 version = "0.1.0"
+dependencies = [
+ "fiducia-interfaces",
+]
 
 [[package]]
 name = "fiducia-telemetry"

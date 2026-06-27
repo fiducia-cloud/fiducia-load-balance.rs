@@ -278,6 +278,20 @@ mod tests {
     }
 
     #[test]
+    fn classifies_not_leader_without_hint_for_round_robin_retry() {
+        match classify_upstream_response(
+            StatusCode::TEMPORARY_REDIRECT,
+            HeaderMap::new(),
+            Bytes::new(),
+        ) {
+            Upstream::NotLeader { leader } => {
+                assert_eq!(leader, None);
+            }
+            other => panic!("unexpected upstream result: {other:?}"),
+        }
+    }
+
+    #[test]
     fn redirect_hint_updates_route_table_before_retry() {
         let table = RouteTable::new(16, vec!["http://old-leader:8090".to_string()]);
         let next = redirected_leader_target(&table, Some(3), "http://new-leader:8090".to_string());

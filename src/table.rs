@@ -102,3 +102,25 @@ impl RouteTable {
         // TODO(cluster): pull placement + membership and repopulate `leaders`/`nodes`.
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_node_round_robins_when_leader_hint_is_missing() {
+        let table = RouteTable::new(
+            4,
+            vec![
+                "http://node-a:8090".to_string(),
+                "http://node-b:8090".to_string(),
+                "http://node-c:8090".to_string(),
+            ],
+        );
+
+        assert_eq!(table.any_node().as_deref(), Some("http://node-a:8090"));
+        assert_eq!(table.any_node().as_deref(), Some("http://node-b:8090"));
+        assert_eq!(table.any_node().as_deref(), Some("http://node-c:8090"));
+        assert_eq!(table.any_node().as_deref(), Some("http://node-a:8090"));
+    }
+}
