@@ -14,8 +14,8 @@
 //! | `/v1/rate-limit/{tenant}/{key}/...`      | `{key}`                             |
 //! | `/v1/cron/schedules/{name}/...`          | `{name}`                            |
 //! | `/v1/elections/{name}/...`               | `{name}`                            |
-//! | `/v1/services/{service}/...`             | `{service}`                         |
-//! | `/v1/kv` (no key), `/v1/services`, `/v1/status`, health | none (any node)     |
+//! | `/v1/services...`                        | **`SERVICE_DISCOVERY_KEY`**         |
+//! | `/v1/kv` (no key), `/v1/status`, health  | none (any node)                     |
 //!
 //! **Locks/semaphores never route by their user key.** A multi-key *union* lock
 //! must be granted atomically and conflict-checked across every member key, which
@@ -26,8 +26,11 @@
 
 use axum::http::Uri;
 
-// Single source of truth for `ShardId`, the hash, and the lock-coordination key.
-pub use fiducia_routing::{lock_coordination_shard, shard_for, LOCK_COORDINATION_KEY, ShardId};
+// Single source of truth for `ShardId`, the hash, and coordination keys.
+pub use fiducia_routing::{
+    lock_coordination_shard, service_discovery_shard, shard_for, ShardId, LOCK_COORDINATION_KEY,
+    SERVICE_DISCOVERY_KEY,
+};
 
 /// Extract the routing key from a request, mirroring the node's API shape.
 ///
@@ -45,9 +48,7 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
         ["v1", "kv"] => query_param(uri, "key"),
         // Locks + semaphores ALWAYS route to the one lock-coordination shard,
         // regardless of the user key (atomic multi-key union needs one SM).
-        ["v1", "locks", ..] | ["v1", "semaphores", ..] => {
-            Some(LOCK_COORDINATION_KEY.to_string())
-        }
+        ["v1", "locks", ..] | ["v1", "semaphores", ..] => Some(LOCK_COORDINATION_KEY.to_string()),
         // Rate limit: /v1/rate-limit/{tenant}/{key}/... → key.
         ["v1", "rate-limit", _tenant, key, ..] | ["v1", "ratelimit", _tenant, key, ..] => {
             Some(percent_decode(key))
@@ -56,9 +57,9 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
         ["v1", "cron", "schedules", name, ..] => Some(percent_decode(name)),
         // Elections: /v1/elections/{name}/... → name.
         ["v1", "elections", name, ..] => Some(percent_decode(name)),
-        // Service discovery: /v1/services/{service}/... → service. Bare list = keyless.
-        ["v1", "services"] => None,
-        ["v1", "services", service, ..] => Some(percent_decode(service)),
+        // Service discovery routes through one registry coordinator so service
+        // names can be listed linearizably without cross-shard scatter-gather.
+        ["v1", "services", ..] => Some(SERVICE_DISCOVERY_KEY.to_string()),
         // status / health / unknown → any node.
         _ => None,
     }
@@ -172,10 +173,26 @@ mod tests {
             key("/v1/elections/cleanup/campaign").as_deref(),
             Some("cleanup")
         );
-        assert_eq!(key("/v1/services/api/instances/i1").as_deref(), Some("api"));
         // keyless / cross-shard / health
-        assert_eq!(key("/v1/services"), None);
         assert_eq!(key("/v1/status"), None);
         assert_eq!(key("/healthz"), None);
+    }
+
+    #[test]
+    fn service_discovery_routes_to_the_registry_coordinator() {
+        for p in [
+            "/v1/services",
+            "/v1/services/api",
+            "/v1/services/api/instances/i1",
+            "/v1/services/api/watch",
+        ] {
+            assert_eq!(key(p).as_deref(), Some(SERVICE_DISCOVERY_KEY));
+        }
+        for n in [4u32, 16, 256] {
+            assert_eq!(
+                shard_for_request(&uri("/v1/services/api/instances/i1"), n).unwrap(),
+                service_discovery_shard(n)
+            );
+        }
     }
 }
