@@ -200,13 +200,18 @@ fn upstream_url(node_url: &str, uri: &Uri) -> Option<String> {
     Some(format!("{}{}", node_url.trim_end_matches('/'), path))
 }
 
+/// Parse a body-level `NotLeader` hint using the **shared** payload contract
+/// (`fiducia_interfaces::ProposeError`), so the LB and node can't drift on the
+/// redirect shape. The node nests the error under `"error"`; a bare error is
+/// also accepted.
 fn json_not_leader_hint(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    let error = value.get("error").unwrap_or(&value);
-    if error.get("reason")?.as_str()? != "not_leader" {
-        return None;
+    let error = value.get("error").cloned().unwrap_or(value);
+    let parsed: fiducia_interfaces::ProposeError = serde_json::from_value(error).ok()?;
+    match parsed.reason {
+        fiducia_interfaces::ProposeErrorReason::NotLeader => parsed.leader,
+        fiducia_interfaces::ProposeErrorReason::Unavailable => None,
     }
-    error.get("leader")?.as_str().map(ToOwned::to_owned)
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
