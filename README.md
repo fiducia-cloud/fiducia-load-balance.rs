@@ -1,7 +1,7 @@
 # fiducia-load-balance
 
 The **edge, key-aware load balancer** for [fiducia.cloud](https://fiducia.cloud).
-End clients speak **HTTP** to this service; it routes each request to the
+End clients speak **HTTP or HTTPS** to this service; it routes each request to the
 **leader of the shard that owns the request's key**. This repository is a
 **skeleton**: routing decisions and the redirect loop are real; byte-level
 forwarding and the control-plane refresh are stubbed.
@@ -35,7 +35,7 @@ run as many instances as you want behind a plain L4 balancer / k8s Service.
 The public request path is:
 
 ```
-client → Cloudflare → regional Fiducia LB → shard leader
+client → Cloudflare/other edge → regional Fiducia LB → shard leader
 ```
 
 Cloudflare should route to a healthy Fiducia LB, preferably the LB closest to the
@@ -45,12 +45,20 @@ key to a shard, forwards to the best-known leader, and learns a newer leader fro
 node `NotLeader` redirects. If a follower cannot name the leader, the LB falls
 back to the known-node round-robin pool.
 
+TLS termination can happen at this LB: set `FIDUCIA_TLS_CERT_PATH` and
+`FIDUCIA_TLS_KEY_PATH` and it will listen on `TLS_PORT` (default `8443`) with
+Rustls while continuing to serve plain HTTP on `PORT` for in-cluster health
+checks or private callers. If Cloudflare is later enabled in front of it, use
+Cloudflare in "Full (strict)" mode and point the origin at the LB HTTPS port; do
+not route Cloudflare directly to node pods.
+
 ## Two planes, two transports
 
 | Plane | Transport | Where |
 |-------|-----------|-------|
-| client ↔ LB ↔ node | **HTTP** (stateless; redirects; long-poll for blocking acquires) | this crate |
-| node ↔ node (Raft replication) | persistent, multiplexed streaming RPC (gRPC / raw TCP) | `fiducia-node`'s `Transport` — **not** here |
+| client ↔ LB | **HTTP or HTTPS**; TLS can terminate here | this crate |
+| LB ↔ node | plain HTTP to the shard leader or redirect target | this crate |
+| node ↔ node (Raft replication) | direct peer RPC to `/raft/{shard}/{append,vote}` using `FIDUCIA_PEERS`; bypasses the LB | `fiducia-node`'s `Transport` — **not** here |
 
 HTTP is first-class for clients precisely because a leader change becomes a
 redirect on the next stateless request — nothing to migrate. (Note: the *edge*
@@ -90,7 +98,7 @@ curl  localhost:8088/_lb/routes
 ```
 
 Env: `PORT`, `FIDUCIA_SHARD_COUNT`, `FIDUCIA_NODES` (comma-separated node URLs),
-`FIDUCIA_BRAIN_URL`.
+`FIDUCIA_BRAIN_URL`, `FIDUCIA_TLS_CERT_PATH`, `FIDUCIA_TLS_KEY_PATH`, `TLS_PORT`.
 
 ## Related
 
