@@ -9,6 +9,7 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -20,7 +21,3 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # Local dev uses a path dep; in CI/deployment switch to a git dep, e.g.:
 #   fiducia-routing = { git = "https://github.com/fiducia-cloud/fiducia-routing.rs", tag = "v0.1.0" }
 fiducia-routing = { path = "../fiducia-routing.rs" }
-
-# NOTE: real upstream forwarding needs an HTTP client (e.g. reqwest or a raw
-# hyper client) to proxy method/headers/body and follow NotLeader redirects.
-# Left out of the skeleton; the forwarding step is stubbed (see src/proxy.rs).
