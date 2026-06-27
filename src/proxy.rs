@@ -115,6 +115,25 @@ fn redirected_leader_target(table: &RouteTable, shard: Option<ShardId>, leader: 
 ///
 /// NotLeader contract: followers may answer either `307` with a `Location`
 /// header or `421` with `x-fiducia-leader`/JSON leader hints. In both cases the
+/// Shared proxy client with redirect-following **disabled on purpose**.
+///
+/// A follower answers a write with `307`/`421` + an `x-fiducia-leader` hint, and
+/// we handle that hop ourselves in [`classify`] — re-issuing the *original*
+/// request path against the leader. If we let reqwest auto-follow, it would chase
+/// the node's `Location` header, which is the nest-stripped path (`/acquire`, not
+/// `/v1/locks/acquire`, since the handler runs under a nested router) and 404 —
+/// exactly the failure seen when the LB's cached leader is stale. Keeping the hop
+/// in our hands means we always retry with the path *we* received.
+fn proxy_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 /// LB updates its stale shard→leader cache and retries the request.
 async fn forward_once(
     node_url: &str,
