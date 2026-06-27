@@ -100,10 +100,17 @@ async fn forward_with_redirect(
 
 /// Forward one request to one node and classify the result.
 ///
+/// NotLeader contract (must match `fiducia-node`'s `propose_response`): a follower
+/// answers **HTTP 421 Misdirected Request** with the shard's leader in the
+/// `x-fiducia-leader` header (and a `{"reason":"not_leader","leader":...}` body).
+/// The follower knows the leader from its own Raft state, so this corrects a
+/// stale LB cache.
+///
 /// TODO: with an HTTP client, send `method` + `uri.path_and_query()` + headers +
-/// body to `{node_url}{path}`, stream the response back, and map a `307`
-/// (or a `{"reason":"not_leader","leader":...}` body) to `Upstream::NotLeader`,
-/// a connection error to `Upstream::Unreachable`, else `Upstream::Served`.
+/// body to `{node_url}{path}`, stream the response back, and map:
+///   * `421` + `x-fiducia-leader` (or the JSON hint) → `Upstream::NotLeader { leader }`
+///   * a connection error                            → `Upstream::Unreachable`
+///   * anything else                                 → `Upstream::Served`
 async fn forward_once(node_url: &str, method: &Method, uri: &Uri) -> Upstream {
     // Skeleton: describe the routing decision instead of forwarding bytes.
     Upstream::Served(
