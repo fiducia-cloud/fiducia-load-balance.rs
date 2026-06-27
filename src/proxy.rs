@@ -114,6 +114,10 @@ fn redirected_leader_target(table: &RouteTable, shard: Option<ShardId>, leader: 
 }
 
 /// Forward one request to one node and classify the result.
+///
+/// NotLeader contract: followers may answer either `307` with a `Location`
+/// header or `421` with `x-fiducia-leader`/JSON leader hints. In both cases the
+/// LB updates its stale shard→leader cache and retries the request.
 async fn forward_once(
     node_url: &str,
     method: &Method,
@@ -167,7 +171,7 @@ async fn forward_once(
 }
 
 fn classify_upstream_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Upstream {
-    if status == StatusCode::TEMPORARY_REDIRECT {
+    if status == StatusCode::TEMPORARY_REDIRECT || status == StatusCode::MISDIRECTED_REQUEST {
         let leader = header_value(&headers, "x-fiducia-leader").or_else(|| {
             header_value(&headers, LOCATION.as_str()).and_then(|v| leader_base_url(&v))
         });
