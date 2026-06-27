@@ -22,10 +22,28 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
 - **Backstop** — if the cache is wrong and the request lands on a follower, the
   node replies `NotLeader` (HTTP `307` + leader hint); the LB follows it and
   updates the cache. Self-healing, the way etcd/TiKV clients work.
+- **No-hint fallback** — if the follower does not know the leader yet, the LB
+  round-robins another known node until a leader responds or the retry budget is
+  exhausted.
 
 The cache is seeded/refreshed from the control plane (`fiducia-brain`'s
 `/v1/placement`). The LB holds **no consensus state** — it's just a cache — so
 run as many instances as you want behind a plain L4 balancer / k8s Service.
+
+## Edge Routing Plan
+
+The public request path is:
+
+```
+client → Cloudflare → regional Fiducia LB → shard leader
+```
+
+Cloudflare should route to a healthy Fiducia LB, preferably the LB closest to the
+customer-selected region. It should not try to route directly to a shard leader;
+leader knowledge belongs to the LB/control-plane cache. The LB hashes the request
+key to a shard, forwards to the best-known leader, and learns a newer leader from
+node `NotLeader` redirects. If a follower cannot name the leader, the LB falls
+back to the known-node round-robin pool.
 
 ## Two planes, two transports
 

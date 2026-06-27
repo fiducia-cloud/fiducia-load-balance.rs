@@ -132,6 +132,25 @@ mod tests {
         );
     }
 
+    // Same round-robin fallback, kept from origin/main for its scenario-focused
+    // name (step 4: follower can't name the leader → the LB round-robins).
+    #[test]
+    fn any_node_round_robins_when_leader_hint_is_missing() {
+        let table = RouteTable::new(
+            4,
+            vec![
+                "http://node-a:8090".to_string(),
+                "http://node-b:8090".to_string(),
+                "http://node-c:8090".to_string(),
+            ],
+        );
+
+        assert_eq!(table.any_node().as_deref(), Some("http://node-a:8090"));
+        assert_eq!(table.any_node().as_deref(), Some("http://node-b:8090"));
+        assert_eq!(table.any_node().as_deref(), Some("http://node-c:8090"));
+        assert_eq!(table.any_node().as_deref(), Some("http://node-a:8090"));
+    }
+
     #[test]
     fn note_leader_corrects_the_cache_and_learns_unknown_nodes() {
         let table = RouteTable::new(8, vec!["http://a:8090".to_string()]);

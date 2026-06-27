@@ -224,6 +224,9 @@ dependencies = [
 [[package]]
 name = "fiducia-routing"
 version = "0.1.0"
+dependencies = [
+ "fiducia-interfaces",
+]
 
 [[package]]
 name = "fiducia-telemetry"
