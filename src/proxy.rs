@@ -49,11 +49,9 @@ pub async fn route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let path = uri.path();
-
     // Keyed request → shard's leader. Keyless (status / list) → any node.
-    let key = routing_key_from_path(path).or_else(|| routing_key_from_json_body(path, &body));
-    let (shard, target) = match key {
+    // (Locks/semaphores resolve to the lock-coordination shard inside `routing_key`.)
+    let (shard, target) = match routing_key(&uri) {
         Some(key) => {
             let shard = shard_for(&key, table.shard_count());
             (Some(shard), table.leader_for(shard))
