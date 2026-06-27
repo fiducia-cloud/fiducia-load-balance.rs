@@ -267,6 +267,21 @@ mod tests {
     }
 
     #[test]
+    fn follower_without_a_leader_hint_yields_none_so_the_lb_round_robins() {
+        // A follower knows it isn't the leader but doesn't know who is: a 307 with
+        // no leader header/Location. The LB gets NotLeader{None} and falls back to
+        // any_node() (round-robin) in forward_with_redirect.
+        match classify_upstream_response(
+            StatusCode::TEMPORARY_REDIRECT,
+            HeaderMap::new(),
+            Bytes::new(),
+        ) {
+            Upstream::NotLeader { leader: None } => {}
+            other => panic!("expected NotLeader{{leader:None}}, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn classifies_json_not_leader_fallback() {
         let body = Bytes::from_static(
             br#"{"committed":false,"error":{"reason":"not_leader","shard":9,"leader":"http://leader-b:8090"}}"#,
