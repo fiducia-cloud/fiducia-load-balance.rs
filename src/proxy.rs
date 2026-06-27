@@ -130,7 +130,7 @@ async fn forward_once(
         return Upstream::Unreachable;
     };
 
-    let client = reqwest::Client::new();
+    let client = proxy_client();
     let mut request = client.request(method, url).body(body);
     for (name, value) in headers {
         if is_hop_by_hop(name.as_str()) {
