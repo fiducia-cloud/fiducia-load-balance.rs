@@ -35,12 +35,16 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use tower_http::{catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use routing::{routing_key_from_path, shard_for};
 use table::RouteTable;
 
 const SERVICE: &str = "fiducia-load-balance";
+
+/// Cap request bodies forwarded through the LB (KV values). NOTE: deliberately
+/// **no request timeout** — the LB proxies blocking lock acquires / long-poll.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
@@ -85,7 +89,11 @@ async fn main() {
         // Everything else is a client request to be routed to a shard leader.
         .fallback(proxy_fallback)
         .with_state(table)
-        .layer(TraceLayer::new_for_http());
+        // Hardening (outermost last): catch handler panics → 500 and cap body
+        // size. No TimeoutLayer — the LB proxies long-poll/blocking acquires.
+        .layer(TraceLayer::new_for_http())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
         .ok()
