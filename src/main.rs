@@ -37,7 +37,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::{catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
-use routing::{routing_key_from_path, shard_for};
+use routing::{routing_key, shard_for};
 use table::RouteTable;
 
 const SERVICE: &str = "fiducia-load-balance";
@@ -137,13 +137,15 @@ struct ResolveParams {
     path: String,
 }
 
-/// `GET /_lb/resolve?path=/v1/kv/foo` — show the routing decision without
-/// forwarding. Handy for verifying key extraction and shard math.
+/// `GET /_lb/resolve?path=/v1/kv?key=foo` — show the routing decision without
+/// forwarding. Handy for verifying key extraction and shard math. The `path`
+/// value may include a query string (e.g. the KV `?key=`).
 async fn resolve(
     State(table): State<Arc<RouteTable>>,
     Query(p): Query<ResolveParams>,
 ) -> Json<Value> {
-    let key = routing_key_from_path(&p.path);
+    let uri: Uri = p.path.parse().unwrap_or_default();
+    let key = routing_key(&uri);
     let shard = key.as_ref().map(|k| shard_for(k, table.shard_count()));
     let target = match shard {
         Some(s) => table.leader_for(s),

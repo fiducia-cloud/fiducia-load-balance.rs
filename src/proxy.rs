@@ -23,7 +23,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::routing::{routing_key_from_json_body, routing_key_from_path, shard_for, ShardId};
+use crate::routing::{routing_key, shard_for, ShardId};
 use crate::table::RouteTable;
 
 /// Max redirect/retry hops before giving up (defeats redirect loops).
@@ -49,11 +49,9 @@ pub async fn route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let path = uri.path();
-
     // Keyed request → shard's leader. Keyless (status / list) → any node.
-    let key = routing_key_from_path(path).or_else(|| routing_key_from_json_body(path, &body));
-    let (shard, target) = match key {
+    // (Locks/semaphores resolve to the lock-coordination shard inside `routing_key`.)
+    let (shard, target) = match routing_key(&uri) {
         Some(key) => {
             let shard = shard_for(&key, table.shard_count());
             (Some(shard), table.leader_for(shard))
@@ -202,13 +200,18 @@ fn upstream_url(node_url: &str, uri: &Uri) -> Option<String> {
     Some(format!("{}{}", node_url.trim_end_matches('/'), path))
 }
 
+/// Parse a body-level `NotLeader` hint using the **shared** payload contract
+/// (`fiducia_interfaces::ProposeError`), so the LB and node can't drift on the
+/// redirect shape. The node nests the error under `"error"`; a bare error is
+/// also accepted.
 fn json_not_leader_hint(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    let error = value.get("error").unwrap_or(&value);
-    if error.get("reason")?.as_str()? != "not_leader" {
-        return None;
+    let error = value.get("error").cloned().unwrap_or(value);
+    let parsed: fiducia_interfaces::ProposeError = serde_json::from_value(error).ok()?;
+    match parsed.reason {
+        fiducia_interfaces::ProposeErrorReason::NotLeader => parsed.leader,
+        fiducia_interfaces::ProposeErrorReason::Unavailable => None,
     }
-    error.get("leader")?.as_str().map(ToOwned::to_owned)
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -260,6 +263,21 @@ mod tests {
                 assert_eq!(leader.as_deref(), Some("http://leader-a:8090"));
             }
             other => panic!("unexpected upstream result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follower_without_a_leader_hint_yields_none_so_the_lb_round_robins() {
+        // A follower knows it isn't the leader but doesn't know who is: a 307 with
+        // no leader header/Location. The LB gets NotLeader{None} and falls back to
+        // any_node() (round-robin) in forward_with_redirect.
+        match classify_upstream_response(
+            StatusCode::TEMPORARY_REDIRECT,
+            HeaderMap::new(),
+            Bytes::new(),
+        ) {
+            Upstream::NotLeader { leader: None } => {}
+            other => panic!("expected NotLeader{{leader:None}}, got {other:?}"),
         }
     }
 

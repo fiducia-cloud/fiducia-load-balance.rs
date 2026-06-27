@@ -21,3 +21,7 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # Local dev uses a path dep; in CI/deployment switch to a git dep, e.g.:
 #   fiducia-routing = { git = "https://github.com/fiducia-cloud/fiducia-routing.rs", tag = "v0.1.0" }
 fiducia-routing = { path = "../fiducia-routing.rs" }
+
+# Shared API payload/error contract — the LB parses the node's NotLeader redirect
+# hint via `fiducia_interfaces::ProposeError`, so node + LB can't drift on it.
+fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }

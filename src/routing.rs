@@ -1,129 +1,181 @@
-//! Request → shard routing (skeleton).
+//! Request → routing-key extraction.
 //!
-//! The load balancer's job starts here: given an incoming request path, find the
-//! **routing key**, hash it to a **shard**, and (elsewhere) look up that shard's
-//! leader. The key extraction must agree with each primitive's
-//! `Command::routing_key` on the node, and the hash must be byte-for-byte the
-//! same as the node's `shard_for`.
+//! The load balancer's job starts here: given an incoming request, find its
+//! **routing key**, hash it to a **shard** (via the shared `fiducia-routing`
+//! crate, so the LB and data plane can never disagree on `key → shard`), and
+//! (elsewhere) look up that shard's leader.
 //!
-//! The `key → shard` mapping itself comes from the shared `fiducia-routing`
-//! crate, so the LB and the data plane can never disagree on where a key lives.
-//! Only request-shape parsing (`routing_key_from_path` plus body-key aliases)
-//! is LB-specific.
+//! The key must be computed exactly as the node's `Command::routing_key` does:
+//!
+//! | Request                                  | Routing key                         |
+//! |------------------------------------------|-------------------------------------|
+//! | `GET/PUT/DELETE /v1/kv?key=K`            | `K` (query param — slash-safe)      |
+//! | `/v1/locks/*`, `/v1/semaphores/*`        | **`LOCK_COORDINATION_KEY`** (always — see below) |
+//! | `/v1/rate-limit/{tenant}/{key}/...`      | `{key}`                             |
+//! | `/v1/cron/schedules/{name}/...`          | `{name}`                            |
+//! | `/v1/elections/{name}/...`               | `{name}`                            |
+//! | `/v1/services/{service}/...`             | `{service}`                         |
+//! | `/v1/kv` (no key), `/v1/services`, `/v1/status`, health | none (any node)     |
+//!
+//! **Locks/semaphores never route by their user key.** A multi-key *union* lock
+//! must be granted atomically and conflict-checked across every member key, which
+//! requires one state machine to see them together — so the node routes *all*
+//! lock/semaphore commands to a single coordinator shard. The LB must do the
+//! same, or a single-key acquire on `B` could land on a different shard than an
+//! active composite lock on `[A, B]` and miss the conflict.
 
-use serde_json::Value;
+use axum::http::Uri;
 
-// Single source of truth for `ShardId` + `shard_for` (the hash).
-pub use fiducia_routing::{shard_for, ShardId};
+// Single source of truth for `ShardId`, the hash, and the lock-coordination key.
+pub use fiducia_routing::{lock_coordination_shard, shard_for, LOCK_COORDINATION_KEY, ShardId};
 
-/// Extract the routing key from a request path, mirroring the node's API shape.
+/// Extract the routing key from a request, mirroring the node's API shape.
 ///
-/// Returns `None` for paths that don't address a single key (health, status, and
-/// cross-shard list endpoints) — those can go to any node.
-///
-/// | Path                                   | Key            |
-/// |----------------------------------------|----------------|
-/// | `/v1/kv/{key}`                         | `{key}`        |
-/// | `/v1/locks/{key}` (+ `/info`)         | `{key}`        |
-/// | `/v1/locks/acquire` + JSON `key`       | body `key`     |
-/// | `/v1/rate-limit/{tenant}/{key}/...`   | `{key}`        |
-/// | `/v1/cron/schedules/{name}/...`       | `{name}`       |
-/// | `/v1/rw/{key}/read|write` (+ `/end`)  | `{key}`        |
-/// | `/v1/elections/{name}/...`            | `{name}`       |
-/// | `/v1/services/{service}/...`          | `{service}`    |
-/// | `/v1/kv`, `/v1/services`, `/v1/status`| none (any node)|
-pub fn routing_key_from_path(path: &str) -> Option<String> {
-    let segs: Vec<&str> = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    // All keyed routes are `/v1/<primitive>/<key>/...`.
-    match segs.as_slice() {
-        ["v1", "kv", key, ..] => Some(decode(key)),
-        ["v1", "locks", "acquire"] => None,
-        ["v1", "locks", key, ..] => Some(decode(key)),
-        ["v1", "rate-limit", _tenant, key, ..] => Some(decode(key)),
-        ["v1", "cron", "schedules", name, ..] => Some(decode(name)),
-        ["v1", "rw", key, ..] => Some(decode(key)),
-        ["v1", "elections", name, ..] => Some(decode(name)),
-        ["v1", "services", service, ..] => Some(decode(service)),
-        _ => None,
-    }
-}
-
-/// Extract the routing key from JSON bodies for advertised body-key aliases.
-pub fn routing_key_from_json_body(path: &str, body: &[u8]) -> Option<String> {
-    let segs: Vec<&str> = path
+/// Returns `None` for requests that don't address a single shard (health,
+/// status, and cross-shard list endpoints) — those can go to any node.
+pub fn routing_key(uri: &Uri) -> Option<String> {
+    let segs: Vec<&str> = uri
+        .path()
         .trim_matches('/')
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();
     match segs.as_slice() {
-        ["v1", "locks", "acquire"] => {
-            let value: Value = serde_json::from_slice(body).ok()?;
-            value.get("key")?.as_str().map(ToOwned::to_owned)
+        // KV: the key is a `?key=` query parameter (slash-safe). No key → list.
+        ["v1", "kv"] => query_param(uri, "key"),
+        // Locks + semaphores ALWAYS route to the one lock-coordination shard,
+        // regardless of the user key (atomic multi-key union needs one SM).
+        ["v1", "locks", ..] | ["v1", "semaphores", ..] => {
+            Some(LOCK_COORDINATION_KEY.to_string())
         }
+        // Rate limit: /v1/rate-limit/{tenant}/{key}/... → key.
+        ["v1", "rate-limit", _tenant, key, ..] | ["v1", "ratelimit", _tenant, key, ..] => {
+            Some(percent_decode(key))
+        }
+        // Cron: /v1/cron/schedules/{name}/... → name.
+        ["v1", "cron", "schedules", name, ..] => Some(percent_decode(name)),
+        // Elections: /v1/elections/{name}/... → name.
+        ["v1", "elections", name, ..] => Some(percent_decode(name)),
+        // Service discovery: /v1/services/{service}/... → service. Bare list = keyless.
+        ["v1", "services"] => None,
+        ["v1", "services", service, ..] => Some(percent_decode(service)),
+        // status / health / unknown → any node.
         _ => None,
     }
 }
 
-/// Minimal percent-decode for the single path segment we route on.
-///
-/// TODO: full RFC-3986 decoding (or take the key from the matched route param
-/// once the LB forwards through a real router rather than a path string).
-fn decode(seg: &str) -> String {
-    seg.replace("%2F", "/").replace("%2f", "/")
+/// Hash a request straight to its shard, or `None` for keyless requests.
+pub fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
+    routing_key(uri).map(|key| shard_for(&key, shard_count))
+}
+
+/// Read a query parameter, percent-decoded.
+fn query_param(uri: &Uri, name: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| percent_decode(v))
+    })
+}
+
+/// Minimal `application/x-www-form-urlencoded` decode (`+`→space, `%XX`→byte),
+/// matching how the node's axum `Query`/path extractors decode keys.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn key_extraction() {
-        assert_eq!(
-            routing_key_from_path("/v1/kv/orders").as_deref(),
-            Some("orders")
-        );
-        assert_eq!(
-            routing_key_from_path("/v1/locks/checkout/info").as_deref(),
-            Some("checkout")
-        );
-        assert_eq!(routing_key_from_path("/v1/locks/acquire"), None);
-        assert_eq!(
-            routing_key_from_path("/v1/rate-limit/acme/checkout/check").as_deref(),
-            Some("checkout")
-        );
-        assert_eq!(
-            routing_key_from_path("/v1/cron/schedules/nightly/history").as_deref(),
-            Some("nightly")
-        );
-        assert_eq!(
-            routing_key_from_path("/v1/rw/report/read").as_deref(),
-            Some("report")
-        );
-        assert_eq!(
-            routing_key_from_path("/v1/elections/cleanup/campaign").as_deref(),
-            Some("cleanup")
-        );
-        assert_eq!(
-            routing_key_from_path("/v1/services/api/instances/i1").as_deref(),
-            Some("api")
-        );
-        // keyless / cross-shard
-        assert_eq!(routing_key_from_path("/v1/kv"), None);
-        assert_eq!(routing_key_from_path("/v1/services"), None);
-        assert_eq!(routing_key_from_path("/healthz"), None);
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+    fn key(s: &str) -> Option<String> {
+        routing_key(&uri(s))
     }
 
     #[test]
-    fn body_key_extraction_for_advertised_lock_acquire_alias() {
-        let body = br#"{"key":"orders/checkout","ttl":"30s"}"#;
+    fn kv_key_comes_from_the_query_param_and_is_slash_safe() {
+        assert_eq!(key("/v1/kv?key=orders").as_deref(), Some("orders"));
         assert_eq!(
-            routing_key_from_json_body("/v1/locks/acquire", body).as_deref(),
-            Some("orders/checkout")
+            key("/v1/kv?key=flags/checkout").as_deref(),
+            Some("flags/checkout")
         );
-        assert_eq!(routing_key_from_json_body("/v1/kv", body), None);
+        assert_eq!(key("/v1/kv?key=a%2Fb").as_deref(), Some("a/b")); // encoded slash
+        assert_eq!(key("/v1/kv?watch=true&key=x").as_deref(), Some("x")); // any position
+        assert_eq!(key("/v1/kv"), None); // no key → keyless (list / any node)
+    }
+
+    #[test]
+    fn all_lock_and_semaphore_requests_route_to_the_one_coordinator_shard() {
+        // Whatever the path/verb, every lock/semaphore op shares the coordinator
+        // key — so they all hash to the SAME shard (the whole point of union locks).
+        let lock_paths = [
+            "/v1/locks/acquire",
+            "/v1/locks/release",
+            "/v1/locks?key=orders/42",
+            "/v1/semaphores/acquire",
+            "/v1/semaphores/release",
+            "/v1/semaphores?key=db-pool",
+        ];
+        for p in lock_paths {
+            assert_eq!(key(p).as_deref(), Some(LOCK_COORDINATION_KEY));
+        }
+        // And that key resolves to the shared coordinator shard.
+        for n in [4u32, 16, 256] {
+            let s = shard_for_request(&uri("/v1/locks/acquire"), n).unwrap();
+            assert_eq!(s, lock_coordination_shard(n));
+            assert_eq!(
+                s,
+                shard_for_request(&uri("/v1/semaphores/acquire"), n).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn other_primitives_route_by_their_path_identifier() {
+        assert_eq!(
+            key("/v1/rate-limit/acme/checkout/check").as_deref(),
+            Some("checkout")
+        );
+        assert_eq!(
+            key("/v1/cron/schedules/nightly/history").as_deref(),
+            Some("nightly")
+        );
+        assert_eq!(
+            key("/v1/elections/cleanup/campaign").as_deref(),
+            Some("cleanup")
+        );
+        assert_eq!(key("/v1/services/api/instances/i1").as_deref(), Some("api"));
+        // keyless / cross-shard / health
+        assert_eq!(key("/v1/services"), None);
+        assert_eq!(key("/v1/status"), None);
+        assert_eq!(key("/healthz"), None);
     }
 }
