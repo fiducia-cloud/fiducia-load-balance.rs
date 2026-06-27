@@ -23,7 +23,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::routing::{routing_key_from_json_body, routing_key_from_path, shard_for, ShardId};
+use crate::routing::{routing_key, shard_for, ShardId};
 use crate::table::RouteTable;
 
 /// Max redirect/retry hops before giving up (defeats redirect loops).
