@@ -17,9 +17,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
 
-# Shared API payload contract generated from fiducia-interfaces.
-fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
-
 # Shared key→shard routing — single source of truth (see fiducia-routing.rs).
 # Local dev uses a path dep; in CI/deployment switch to a git dep, e.g.:
 #   fiducia-routing = { git = "https://github.com/fiducia-cloud/fiducia-routing.rs", tag = "v0.1.0" }
