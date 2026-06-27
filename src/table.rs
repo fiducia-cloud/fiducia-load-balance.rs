@@ -102,3 +102,51 @@ impl RouteTable {
         // TODO(cluster): pull placement + membership and repopulate `leaders`/`nodes`.
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn any_node_round_robins_over_known_nodes() {
+        // The fallback when a follower can't name the leader: cycle the nodes.
+        let table = RouteTable::new(
+            8,
+            vec![
+                "http://a:8090".to_string(),
+                "http://b:8090".to_string(),
+                "http://c:8090".to_string(),
+            ],
+        );
+        let seq: Vec<String> = (0..6).map(|_| table.any_node().unwrap()).collect();
+        assert_eq!(
+            seq,
+            vec![
+                "http://a:8090",
+                "http://b:8090",
+                "http://c:8090",
+                "http://a:8090",
+                "http://b:8090",
+                "http://c:8090",
+            ],
+        );
+    }
+
+    #[test]
+    fn note_leader_corrects_the_cache_and_learns_unknown_nodes() {
+        let table = RouteTable::new(8, vec!["http://a:8090".to_string()]);
+        // A redirect hint to a node we didn't know about.
+        table.note_leader(3, "http://new:8090".to_string());
+        assert_eq!(table.leader_for(3).as_deref(), Some("http://new:8090"));
+        // The learned node now participates in round-robin too.
+        let nodes: Vec<String> = (0..2).map(|_| table.any_node().unwrap()).collect();
+        assert!(nodes.contains(&"http://new:8090".to_string()));
+    }
+
+    #[test]
+    fn empty_table_has_no_node_to_route_to() {
+        let table = RouteTable::new(8, vec![]);
+        assert!(table.any_node().is_none());
+        assert!(table.leader_for(0).is_none());
+    }
+}
