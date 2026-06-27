@@ -13,10 +13,9 @@
 //!   * **node ↔ node** (Raft replication) — a persistent, multiplexed streaming
 //!     transport (gRPC/raw TCP), **not** this. See `fiducia-node`'s `Transport`.
 //!
-//! This is a **skeleton**: routing decisions and the redirect loop are real; the
-//! byte-level forwarding and the brain refresh are stubbed (see `proxy.rs` /
-//! `table.rs`). The LB is stateless, so run as many instances as you like behind
-//! a plain L4 balancer.
+//! The forwarding path follows node `NotLeader` redirects and self-corrects its
+//! cache; the control-plane refresh is still stubbed (see `table.rs`). The LB is
+//! stateless, so run as many instances as you like behind a plain L4 balancer.
 
 mod proxy;
 mod routing;
@@ -27,8 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    body::Bytes,
     extract::{Query, State},
-    http::{Method, Uri},
+    http::{HeaderMap, Method, Uri},
     response::Response,
     routing::get,
     Json, Router,
@@ -47,7 +47,7 @@ const SERVICE: &str = "fiducia-load-balance";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     let shard_count: u32 = std::env::var("FIDUCIA_SHARD_COUNT")
@@ -59,7 +59,12 @@ async fn main() {
     // / redirects fill in the real shard→leader map.
     let nodes: Vec<String> = std::env::var("FIDUCIA_NODES")
         .ok()
-        .map(|s| s.split(',').filter(|n| !n.is_empty()).map(String::from).collect())
+        .map(|s| {
+            s.split(',')
+                .filter(|n| !n.is_empty())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default();
 
     let brain_url =
@@ -102,8 +107,9 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     tracing::info!("{SERVICE} listening on http://{addr} (shards={shard_count})");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn healthz() -> Json<Value> {
@@ -115,8 +121,10 @@ async fn proxy_fallback(
     State(table): State<Arc<RouteTable>>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    proxy::route(table, method, uri).await
+    proxy::route(table, method, uri, headers, body).await
 }
 
 /// `GET /_lb/routes` — dump the current shard→leader cache.

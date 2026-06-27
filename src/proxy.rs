@@ -1,4 +1,4 @@
-//! Forwarding with NotLeader redirect handling (skeleton).
+//! Forwarding with NotLeader redirect handling.
 //!
 //! HTTP is the first-class client protocol, so forwarding is a plain HTTP
 //! reverse-proxy hop with one extra rule: if the chosen node turns out to be a
@@ -10,25 +10,27 @@
 //! next stateless request, with nothing to migrate. (Blocking lock acquires use
 //! HTTP long-poll; there is no persistent client socket to fail over.)
 //!
-//! Skeleton: the routing *decision* and the redirect *loop shape* are real; the
-//! actual byte-forwarding ([`forward_once`]) is stubbed pending an HTTP client.
+//! The routing decision and redirect loop are both real. `NotLeader` is a
+//! self-healing cache correction, not a client-visible failure.
 
 use std::sync::Arc;
 
 use axum::{
-    http::{Method, StatusCode, Uri},
+    body::{Body, Bytes},
+    http::{header::LOCATION, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
-use crate::routing::{routing_key_from_path, shard_for, ShardId};
+use crate::routing::{routing_key_from_json_body, routing_key_from_path, shard_for, ShardId};
 use crate::table::RouteTable;
 
 /// Max redirect/retry hops before giving up (defeats redirect loops).
 const MAX_HOPS: usize = 4;
 
 /// What a single upstream attempt told us.
+#[derive(Debug)]
 enum Upstream {
     /// The node served the request (any normal status code).
     Served(Response),
@@ -40,11 +42,18 @@ enum Upstream {
 }
 
 /// Entry point: resolve the target for a request and forward it.
-pub async fn route(table: Arc<RouteTable>, method: Method, uri: Uri) -> Response {
+pub async fn route(
+    table: Arc<RouteTable>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let path = uri.path();
 
     // Keyed request → shard's leader. Keyless (status / list) → any node.
-    let (shard, target) = match routing_key_from_path(path) {
+    let key = routing_key_from_path(path).or_else(|| routing_key_from_json_body(path, &body));
+    let (shard, target) = match key {
         Some(key) => {
             let shard = shard_for(&key, table.shard_count());
             (Some(shard), table.leader_for(shard))
@@ -60,7 +69,7 @@ pub async fn route(table: Arc<RouteTable>, method: Method, uri: Uri) -> Response
             .into_response();
     };
 
-    forward_with_redirect(table, target, shard, method, uri).await
+    forward_with_redirect(table, target, shard, method, uri, headers, body).await
 }
 
 /// Forward to `target`, following `NotLeader` redirects up to [`MAX_HOPS`].
@@ -70,17 +79,16 @@ async fn forward_with_redirect(
     shard: Option<ShardId>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     for _ in 0..MAX_HOPS {
-        match forward_once(&target, &method, &uri).await {
+        match forward_once(&target, &method, &uri, &headers, body.clone()).await {
             Upstream::Served(resp) => return resp,
-            Upstream::NotLeader { leader: Some(leader) } => {
-                // Cache the correction (for the request's shard) so the next
-                // request skips the bounce.
-                if let Some(s) = shard {
-                    table.note_leader(s, leader.clone());
-                }
-                target = leader;
+            Upstream::NotLeader {
+                leader: Some(leader),
+            } => {
+                target = redirected_leader_target(&table, shard, leader);
             }
             Upstream::NotLeader { leader: None } | Upstream::Unreachable => {
                 // No hint / dead node: pick another and retry.
@@ -98,31 +106,194 @@ async fn forward_with_redirect(
         .into_response()
 }
 
+fn redirected_leader_target(table: &RouteTable, shard: Option<ShardId>, leader: String) -> String {
+    if let Some(s) = shard {
+        table.note_leader(s, leader.clone());
+    }
+    leader
+}
+
 /// Forward one request to one node and classify the result.
 ///
-/// NotLeader contract (must match `fiducia-node`'s `propose_response`): a follower
-/// answers **HTTP 421 Misdirected Request** with the shard's leader in the
-/// `x-fiducia-leader` header (and a `{"reason":"not_leader","leader":...}` body).
-/// The follower knows the leader from its own Raft state, so this corrects a
-/// stale LB cache.
-///
-/// TODO: with an HTTP client, send `method` + `uri.path_and_query()` + headers +
-/// body to `{node_url}{path}`, stream the response back, and map:
-///   * `421` + `x-fiducia-leader` (or the JSON hint) → `Upstream::NotLeader { leader }`
-///   * a connection error                            → `Upstream::Unreachable`
-///   * anything else                                 → `Upstream::Served`
-async fn forward_once(node_url: &str, method: &Method, uri: &Uri) -> Upstream {
-    // Skeleton: describe the routing decision instead of forwarding bytes.
-    Upstream::Served(
-        Json(json!({
-            "lb": "fiducia-load-balance",
-            "note": "forwarding is stubbed; this is the routing decision",
-            "would_forward": {
-                "method": method.as_str(),
-                "path": uri.path(),
-                "to": node_url,
-            },
-        }))
-        .into_response(),
+/// NotLeader contract: followers may answer either `307` with a `Location`
+/// header or `421` with `x-fiducia-leader`/JSON leader hints. In both cases the
+/// LB updates its stale shard→leader cache and retries the request.
+async fn forward_once(
+    node_url: &str,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Upstream {
+    let Some(url) = upstream_url(node_url, uri) else {
+        return Upstream::Unreachable;
+    };
+    let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
+        return Upstream::Unreachable;
+    };
+
+    let client = reqwest::Client::new();
+    let mut request = client.request(method, url).body(body);
+    for (name, value) in headers {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            request = request.header(name, value);
+        }
+    }
+
+    let Ok(response) = request.send().await else {
+        return Upstream::Unreachable;
+    };
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response_headers = HeaderMap::new();
+    for (name, value) in response.headers() {
+        if is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_str().as_bytes()),
+            axum::http::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            response_headers.insert(name, value);
+        }
+    }
+    let Ok(body) = response.bytes().await else {
+        return Upstream::Unreachable;
+    };
+
+    classify_upstream_response(status, response_headers, body)
+}
+
+fn classify_upstream_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Upstream {
+    if status == StatusCode::TEMPORARY_REDIRECT || status == StatusCode::MISDIRECTED_REQUEST {
+        let leader = header_value(&headers, "x-fiducia-leader").or_else(|| {
+            header_value(&headers, LOCATION.as_str()).and_then(|v| leader_base_url(&v))
+        });
+        return Upstream::NotLeader { leader };
+    }
+
+    if let Some(leader) = json_not_leader_hint(&body) {
+        return Upstream::NotLeader {
+            leader: Some(leader),
+        };
+    }
+
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    for (name, value) in headers {
+        if let Some(name) = name {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    Upstream::Served(response)
+}
+
+fn upstream_url(node_url: &str, uri: &Uri) -> Option<String> {
+    if !(node_url.starts_with("http://") || node_url.starts_with("https://")) {
+        return None;
+    }
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    Some(format!("{}{}", node_url.trim_end_matches('/'), path))
+}
+
+fn json_not_leader_hint(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    if error.get("reason")?.as_str()? != "not_leader" {
+        return None;
+    }
+    error.get("leader")?.as_str().map(ToOwned::to_owned)
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn leader_base_url(location: &str) -> Option<String> {
+    let uri: Uri = location.parse().ok()?;
+    let scheme = uri.scheme_str()?;
+    let authority = uri.authority()?;
+    Some(format!("{scheme}://{authority}"))
+}
+
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_node_not_leader_redirect_from_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fiducia-not-leader", "true".parse().unwrap());
+        headers.insert("x-fiducia-leader", "http://leader-a:8090".parse().unwrap());
+        headers.insert(
+            LOCATION,
+            "http://leader-a:8090/v1/kv/orders".parse().unwrap(),
+        );
+
+        match classify_upstream_response(StatusCode::TEMPORARY_REDIRECT, headers, Bytes::new()) {
+            Upstream::NotLeader { leader } => {
+                assert_eq!(leader.as_deref(), Some("http://leader-a:8090"));
+            }
+            other => panic!("unexpected upstream result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_json_not_leader_fallback() {
+        let body = Bytes::from_static(
+            br#"{"committed":false,"error":{"reason":"not_leader","shard":9,"leader":"http://leader-b:8090"}}"#,
+        );
+
+        match classify_upstream_response(StatusCode::OK, HeaderMap::new(), body) {
+            Upstream::NotLeader { leader } => {
+                assert_eq!(leader.as_deref(), Some("http://leader-b:8090"));
+            }
+            other => panic!("unexpected upstream result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_hint_updates_route_table_before_retry() {
+        let table = RouteTable::new(16, vec!["http://old-leader:8090".to_string()]);
+        let next = redirected_leader_target(&table, Some(3), "http://new-leader:8090".to_string());
+
+        assert_eq!(next, "http://new-leader:8090");
+        assert_eq!(
+            table.leader_for(3).as_deref(),
+            Some("http://new-leader:8090")
+        );
+    }
+
+    #[test]
+    fn location_header_can_supply_leader_base_url() {
+        assert_eq!(
+            leader_base_url("http://leader-c:8090/v1/kv/orders?x=1").as_deref(),
+            Some("http://leader-c:8090")
+        );
+    }
 }
