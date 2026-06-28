@@ -14,7 +14,8 @@
 //! | `/v1/rate-limit/{tenant}/{key}/...`      | `{key}`                             |
 //! | `/v1/cron/schedules/{name}/...`          | `{name}`                            |
 //! | `/v1/elections/{name}/...`               | `{name}`                            |
-//! | `/v1/services...`                        | **`SERVICE_DISCOVERY_KEY`**         |
+//! | `/v1/services/{service}/...`             | `{service}`                         |
+//! | `/v1/services` (list all)                | none (any node fans out)            |
 //! | `/v1/kv` (no key), `/v1/status`, health  | none (any node)                     |
 //!
 //! **Locks/semaphores never route by their user key.** A multi-key *union* lock
