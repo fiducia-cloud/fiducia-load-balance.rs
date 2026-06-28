@@ -636,6 +636,8 @@ mod tests {
             "x-fiducia-org-id",
             "x-fiducia-key-id",
             "x-fiducia-scopes",
+            "x-fiducia-internal-auth",
+            "X-Fiducia-Internal-Auth",
         ] {
             assert!(should_strip_client_auth_header(name));
         }
