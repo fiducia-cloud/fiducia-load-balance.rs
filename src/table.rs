@@ -190,6 +190,32 @@ impl RouteTable {
     }
 }
 
+/// GET a URL and parse the body as JSON. Returns `None` (and logs) on any
+/// transport/status/parse error — a failed refresh just leaves the stale table
+/// in place. Uses `bytes()` so it works without reqwest's optional `json` feature.
+async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<Value> {
+    let resp = match client.get(url).send().await.and_then(|r| r.error_for_status()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(error = %e, url, "brain refresh: request failed");
+            return None;
+        }
+    };
+    match resp.bytes().await {
+        Ok(body) => match serde_json::from_slice(&body) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, url, "brain refresh: body not JSON");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, url, "brain refresh: body read failed");
+            None
+        }
+    }
+}
+
 /// Ensure a node address carries a scheme; the brain reports bare `host:port`.
 fn normalize_url(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") {
