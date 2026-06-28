@@ -46,9 +46,17 @@ const SERVICE: &str = "fiducia-load-balance";
 /// **no request timeout** — the LB proxies blocking lock acquires / long-poll.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, Clone)]
+struct TlsSettings {
+    cert_path: String,
+    key_path: String,
+    port: u16,
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     fiducia_telemetry::init(SERVICE);
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let shard_count: u32 = std::env::var("FIDUCIA_SHARD_COUNT")
         .ok()
@@ -84,7 +92,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let app = Router::new()
+    let app = build_app(table);
+
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8088);
+    let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let http = serve_http(http_addr, app.clone());
+
+    if let Some(tls) = tls_settings()? {
+        let tls_addr = SocketAddr::from(([0, 0, 0, 0], tls.port));
+        let https = serve_https(tls_addr, app, tls);
+        tokio::select! {
+            result = http => result?,
+            result = https => result?,
+        }
+    } else {
+        http.await?;
+    }
+
+    Ok(())
+}
+
+fn build_app(table: Arc<RouteTable>) -> Router {
+    Router::new()
         // LB's own liveness (not proxied).
         .route("/healthz", get(healthz))
         .route("/readyz", get(healthz))
@@ -98,18 +130,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // size. No TimeoutLayer — the LB proxies long-poll/blocking acquires.
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+}
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8088);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    tracing::info!("{SERVICE} listening on http://{addr} (shards={shard_count})");
+async fn serve_http(
+    addr: SocketAddr,
+    app: Router,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("{SERVICE} listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn serve_https(
+    addr: SocketAddr,
+    app: Router,
+    tls: TlsSettings,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        tls.cert_path,
+        tls.key_path,
+    )
+    .await?;
+    tracing::info!("{SERVICE} listening on https://{addr}");
+    axum_server::bind_rustls(addr, config)
+        .serve(app.into_make_service())
+        .await?;
+    Ok(())
+}
+
+fn tls_settings() -> Result<Option<TlsSettings>, Box<dyn std::error::Error + Send + Sync>> {
+    let cert_path = std::env::var("FIDUCIA_TLS_CERT_PATH").ok();
+    let key_path = std::env::var("FIDUCIA_TLS_KEY_PATH").ok();
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let port = std::env::var("TLS_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8443);
+            Ok(Some(TlsSettings {
+                cert_path,
+                key_path,
+                port,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err("set both FIDUCIA_TLS_CERT_PATH and FIDUCIA_TLS_KEY_PATH, or neither".into()),
+    }
 }
 
 async fn healthz() -> Json<Value> {
@@ -161,6 +229,7 @@ async fn resolve(
 
 #[cfg(test)]
 mod interface_contract_tests {
+    use super::*;
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
     #[test]
@@ -177,5 +246,27 @@ mod interface_contract_tests {
             ProposeErrorReason::NotLeader,
             ProposeErrorReason::NotLeader
         ));
+    }
+
+    #[test]
+    fn tls_settings_require_cert_and_key_together() {
+        std::env::remove_var("FIDUCIA_TLS_CERT_PATH");
+        std::env::remove_var("FIDUCIA_TLS_KEY_PATH");
+        std::env::remove_var("TLS_PORT");
+        assert!(tls_settings().unwrap().is_none());
+
+        std::env::set_var("FIDUCIA_TLS_CERT_PATH", "/tls/tls.crt");
+        assert!(tls_settings().is_err());
+
+        std::env::set_var("FIDUCIA_TLS_KEY_PATH", "/tls/tls.key");
+        std::env::set_var("TLS_PORT", "9443");
+        let settings = tls_settings().unwrap().unwrap();
+        assert_eq!(settings.cert_path, "/tls/tls.crt");
+        assert_eq!(settings.key_path, "/tls/tls.key");
+        assert_eq!(settings.port, 9443);
+
+        std::env::remove_var("FIDUCIA_TLS_CERT_PATH");
+        std::env::remove_var("FIDUCIA_TLS_KEY_PATH");
+        std::env::remove_var("TLS_PORT");
     }
 }

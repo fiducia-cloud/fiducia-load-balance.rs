@@ -95,11 +95,137 @@ impl RouteTable {
 
     /// Refresh the shard map from the control plane.
     ///
-    /// TODO: GET `{brain_url}/v1/placement`, then for each shard set the leader to
-    /// its `preferred_leader` (or any replica) resolved to a node URL via the
-    /// brain's membership view. Needs an HTTP client (see Cargo.toml note).
-    pub async fn refresh_from_brain(&self, _brain_url: &str) {
-        // TODO(cluster): pull placement + membership and repopulate `leaders`/`nodes`.
+    /// Pulls the brain's membership (`/v1/nodes`) to learn `node_id → address`,
+    /// then its placement map (`/v1/placement`) to learn each shard's preferred
+    /// leader, and repopulates `nodes`/`leaders`. The table stays *advisory*: a
+    /// stale entry just costs one redirect, which [`note_leader`] then corrects.
+    pub async fn refresh_from_brain(&self, brain_url: &str) {
+        let base = brain_url.trim_end_matches('/');
+        let client = reqwest::Client::new();
+
+        // 1. node_id -> base URL, for healthy nodes only.
+        let nodes_doc: Value = match client
+            .get(format!("{base}/v1/nodes"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "brain refresh: /v1/nodes body not JSON");
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, brain = %base, "brain refresh: /v1/nodes unreachable");
+                return;
+            }
+        };
+
+        let mut node_url: HashMap<String, String> = HashMap::new();
+        let mut healthy_urls: Vec<String> = Vec::new();
+        if let Some(arr) = nodes_doc.get("nodes").and_then(|v| v.as_array()) {
+            for n in arr {
+                let Some(id) = n.get("node_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(addr) = n.get("address").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if addr.is_empty() {
+                    continue;
+                }
+                let url = normalize_url(addr);
+                // "dead"/"draining" nodes stay routable as a last resort but are
+                // never preferred; only healthy nodes seed the round-robin pool.
+                let healthy = n
+                    .get("health")
+                    .and_then(|v| v.as_str())
+                    .map(|h| h == "healthy")
+                    .unwrap_or(true);
+                if healthy {
+                    healthy_urls.push(url.clone());
+                }
+                node_url.insert(id.to_string(), url);
+            }
+        }
+
+        // 2. placement -> per-shard preferred leader (or first replica).
+        let placement_doc: Value = match client
+            .get(format!("{base}/v1/placement"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "brain refresh: /v1/placement body not JSON");
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, brain = %base, "brain refresh: /v1/placement unreachable");
+                return;
+            }
+        };
+
+        let mut leaders: HashMap<ShardId, String> = HashMap::new();
+        if let Some(shards) = placement_doc.get("shards").and_then(|v| v.as_array()) {
+            for a in shards {
+                let Some(shard) = a.get("shard_id").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let shard = shard as ShardId;
+                // Prefer the brain's chosen leader; fall back to any replica.
+                let leader_id = a
+                    .get("preferred_leader")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        a.get("replicas")
+                            .and_then(|v| v.as_array())
+                            .and_then(|r| r.first())
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                if let Some(url) = leader_id.and_then(|id| node_url.get(&id).cloned()) {
+                    leaders.insert(shard, url);
+                }
+            }
+        }
+
+        // 3. Install the refreshed view. Keep any nodes we already knew (e.g. from
+        // redirects) so we never shrink the routable set on a partial brain view.
+        let mut inner = self.inner.write().unwrap();
+        for url in healthy_urls {
+            if !inner.nodes.contains(&url) {
+                inner.nodes.push(url);
+            }
+        }
+        for url in node_url.values() {
+            if !inner.nodes.contains(url) {
+                inner.nodes.push(url.clone());
+            }
+        }
+        if !leaders.is_empty() {
+            inner.leaders = leaders;
+        }
+        tracing::debug!(
+            nodes = inner.nodes.len(),
+            leaders = inner.leaders.len(),
+            "brain refresh: routing table updated"
+        );
+    }
+}
+
+/// Ensure a node address carries a scheme; the brain reports bare `host:port`.
+fn normalize_url(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
     }
 }
 

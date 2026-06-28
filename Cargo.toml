@@ -6,10 +6,12 @@ description = "Edge load balancer / key-aware router for fiducia.cloud — route
 
 [dependencies]
 axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower-http = { version = "0.5", features = ["trace", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
