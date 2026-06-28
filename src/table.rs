@@ -294,4 +294,11 @@ mod tests {
         assert!(table.any_node().is_none());
         assert!(table.leader_for(0).is_none());
     }
+
+    #[test]
+    fn normalize_url_adds_scheme_only_when_missing() {
+        assert_eq!(normalize_url("10.0.0.1:8090"), "http://10.0.0.1:8090");
+        assert_eq!(normalize_url("http://a:8090"), "http://a:8090");
+        assert_eq!(normalize_url("https://a:8090"), "https://a:8090");
+    }
 }
