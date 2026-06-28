@@ -43,6 +43,7 @@ enum Upstream {
 }
 
 /// Entry point: resolve the target for a request and forward it.
+#[tracing::instrument(name = "lb.route", skip_all, fields(method = %method, path = %uri.path()))]
 pub async fn route(
     table: Arc<RouteTable>,
     identity: Option<VerifiedIdentity>,
@@ -62,6 +63,7 @@ pub async fn route(
     };
 
     let Some(target) = target else {
+        tracing::warn!(shard = ?shard, "lb: no known node for this request — returning 503");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "no_route", "detail": "no known node for this request", "shard": shard })),
@@ -69,6 +71,7 @@ pub async fn route(
             .into_response();
     };
 
+    tracing::debug!(shard = ?shard, target = %target, "lb: forwarding to node");
     forward_with_redirect(table, identity, target, shard, method, uri, headers, body).await
 }
 
@@ -83,7 +86,7 @@ async fn forward_with_redirect(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    for _ in 0..MAX_HOPS {
+    for hop in 0..MAX_HOPS {
         table.record_region_request(&target);
         match forward_once(
             &target,
@@ -95,14 +98,21 @@ async fn forward_with_redirect(
         )
         .await
         {
-            Upstream::Served(resp) => return resp,
+            Upstream::Served(resp) => {
+                if hop > 0 {
+                    tracing::debug!(shard = ?shard, hops = hop, target = %target, "lb: served after redirect/retry");
+                }
+                return resp;
+            }
             Upstream::NotLeader {
                 leader: Some(leader),
             } => {
+                tracing::info!(shard = ?shard, hop, from = %target, to = %leader, "lb: follower redirect — retrying leader, refreshing cache");
                 target = redirected_leader_target(&table, shard, leader);
             }
             Upstream::NotLeader { leader: None } | Upstream::Unreachable => {
                 // No hint / dead node: pick another and retry.
+                tracing::warn!(shard = ?shard, hop, target = %target, "lb: node unreachable / no leader hint — failing over to another node");
                 match table.any_node() {
                     Some(next) => target = next,
                     None => break,
@@ -110,6 +120,7 @@ async fn forward_with_redirect(
             }
         }
     }
+    tracing::error!(shard = ?shard, max_hops = MAX_HOPS, "lb: exhausted redirects/retries — returning 502");
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({ "error": "no_leader", "detail": "exhausted redirects/retries" })),
@@ -142,6 +153,16 @@ fn proxy_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // Bounded timeouts so an UNRESPONSIVE (frozen, not crashed) node is
+            // shed quickly: a frozen leader keeps its TCP socket open, so without
+            // a request timeout the LB would hang on it forever instead of failing
+            // over to the new leader. Connect timeout catches a truly dead host
+            // fast; the request timeout catches the connected-but-silent case.
+            // NOTE: these bound EVERY proxied request, so when real long-poll lock
+            // waits / KV watch streams land, route those through a separate
+            // long-timeout client.
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
