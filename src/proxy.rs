@@ -42,6 +42,7 @@ enum Upstream {
 }
 
 /// Entry point: resolve the target for a request and forward it.
+#[tracing::instrument(name = "lb.route", skip_all, fields(method = %method, path = %uri.path()))]
 pub async fn route(
     table: Arc<RouteTable>,
     method: Method,
