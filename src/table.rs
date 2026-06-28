@@ -1,4 +1,4 @@
-//! Shard → leader routing table (skeleton).
+//! Shard → leader routing table.
 //!
 //! The LB's cache of "who leads shard N right now". It is **allowed to be
 //! stale**: the fast path uses it to route straight to a leader, and when it's
@@ -10,19 +10,34 @@
 //! run behind a plain L4 balancer.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::routing::ShardId;
 
+const DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS: u64 = 2;
+
 struct Inner {
     /// Node base URLs known to the cluster (e.g. `http://10.0.0.1:8090`).
     nodes: Vec<String>,
+    /// Region/provider metadata by node URL, learned from brain membership.
+    node_metadata: HashMap<String, NodeMetadata>,
     /// Best-known leader per shard. May be stale; corrected on redirect.
     leaders: HashMap<ShardId, String>,
+    /// Best-effort routed request counts by leader region.
+    region_requests: HashMap<String, u64>,
     /// Round-robin cursor for keyless ("any node") requests.
     cursor: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NodeMetadata {
+    cloud_provider: String,
+    region: String,
+    cluster_id: String,
 }
 
 pub struct RouteTable {
@@ -44,7 +59,9 @@ impl RouteTable {
             shard_count,
             inner: RwLock::new(Inner {
                 nodes,
+                node_metadata: HashMap::new(),
                 leaders,
+                region_requests: HashMap::new(),
                 cursor: 0,
             }),
         }
@@ -68,6 +85,23 @@ impl RouteTable {
         inner.leaders.insert(shard, node_url);
     }
 
+    /// Count a routed request against the resolved leader's region.
+    pub fn record_region_request(&self, node_url: &str) {
+        let mut inner = self.inner.write().unwrap();
+        let region = inner
+            .node_metadata
+            .get(node_url)
+            .map(|m| {
+                if m.region.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    m.region.clone()
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        *inner.region_requests.entry(region).or_default() += 1;
+    }
+
     /// A node for keyless requests (status / cross-shard lists), round-robined.
     pub fn any_node(&self) -> Option<String> {
         let mut inner = self.inner.write().unwrap();
@@ -84,144 +118,204 @@ impl RouteTable {
         let inner = self.inner.read().unwrap();
         let mut leaders: Vec<_> = inner.leaders.iter().collect();
         leaders.sort_by_key(|(s, _)| **s);
+        let mut node_metadata: Vec<_> = inner.node_metadata.iter().collect();
+        node_metadata.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let mut region_requests: Vec<_> = inner.region_requests.iter().collect();
+        region_requests.sort_by(|(a, _), (b, _)| a.cmp(b));
         json!({
             "shard_count": self.shard_count,
             "nodes": inner.nodes,
+            "node_metadata": node_metadata.into_iter()
+                .map(|(url, m)| json!({
+                    "url": url,
+                    "cloud_provider": m.cloud_provider,
+                    "region": m.region,
+                    "cluster_id": m.cluster_id,
+                }))
+                .collect::<Vec<_>>(),
             "leaders": leaders.into_iter()
                 .map(|(s, n)| json!({ "shard": s, "leader": n }))
                 .collect::<Vec<_>>(),
+            "metrics": {
+                "region_requests": region_requests.into_iter()
+                    .map(|(region, count)| json!({ "region": region, "requests": count }))
+                    .collect::<Vec<_>>(),
+            },
         })
     }
 
     /// Refresh the shard map from the control plane.
-    ///
-    /// Pulls the brain's membership (`/v1/nodes`) to learn `node_id → address`,
-    /// then its placement map (`/v1/placement`) to learn each shard's preferred
-    /// leader, and repopulates `nodes`/`leaders`. The table stays *advisory*: a
-    /// stale entry just costs one redirect, which [`note_leader`] then corrects.
     pub async fn refresh_from_brain(&self, brain_url: &str) {
         let base = brain_url.trim_end_matches('/');
-        let client = reqwest::Client::new();
-
-        // 1. node_id -> base URL, for healthy nodes only.
-        let Some(nodes_doc) = fetch_json(&client, &format!("{base}/v1/nodes")).await else {
-            return;
+        let client = brain_client();
+        let nodes = match client
+            .get(format!("{base}/v1/nodes"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json::<BrainNodes>().await {
+                Ok(nodes) => nodes,
+                Err(err) => {
+                    tracing::warn!(?err, "failed to parse brain node snapshot");
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(?err, "failed to refresh brain node snapshot");
+                return;
+            }
         };
-
-        let mut node_url: HashMap<String, String> = HashMap::new();
-        let mut healthy_urls: Vec<String> = Vec::new();
-        if let Some(arr) = nodes_doc.get("nodes").and_then(|v| v.as_array()) {
-            for n in arr {
-                let Some(id) = n.get("node_id").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Some(addr) = n.get("address").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if addr.is_empty() {
-                    continue;
+        let placement = match client
+            .get(format!("{base}/v1/placement"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json::<BrainPlacement>().await {
+                Ok(placement) => placement,
+                Err(err) => {
+                    tracing::warn!(?err, "failed to parse brain placement snapshot");
+                    return;
                 }
-                let url = normalize_url(addr);
-                // "dead"/"draining" nodes stay routable as a last resort but are
-                // never preferred; only healthy nodes seed the round-robin pool.
-                let healthy = n
-                    .get("health")
-                    .and_then(|v| v.as_str())
-                    .map(|h| h == "healthy")
-                    .unwrap_or(true);
-                if healthy {
-                    healthy_urls.push(url.clone());
-                }
-                node_url.insert(id.to_string(), url);
+            },
+            Err(err) => {
+                tracing::warn!(?err, "failed to refresh brain placement snapshot");
+                return;
             }
-        }
-
-        // 2. placement -> per-shard preferred leader (or first replica).
-        let Some(placement_doc) = fetch_json(&client, &format!("{base}/v1/placement")).await else {
-            return;
         };
-
-        let mut leaders: HashMap<ShardId, String> = HashMap::new();
-        if let Some(shards) = placement_doc.get("shards").and_then(|v| v.as_array()) {
-            for a in shards {
-                let Some(shard) = a.get("shard_id").and_then(|v| v.as_u64()) else {
-                    continue;
-                };
-                let shard = shard as ShardId;
-                // Prefer the brain's chosen leader; fall back to any replica.
-                let leader_id = a
-                    .get("preferred_leader")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        a.get("replicas")
-                            .and_then(|v| v.as_array())
-                            .and_then(|r| r.first())
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    });
-                if let Some(url) = leader_id.and_then(|id| node_url.get(&id).cloned()) {
-                    leaders.insert(shard, url);
-                }
-            }
-        }
-
-        // 3. Install the refreshed view. Keep any nodes we already knew (e.g. from
-        // redirects) so we never shrink the routable set on a partial brain view.
-        let mut inner = self.inner.write().unwrap();
-        for url in healthy_urls {
-            if !inner.nodes.contains(&url) {
-                inner.nodes.push(url);
-            }
-        }
-        for url in node_url.values() {
-            if !inner.nodes.contains(url) {
-                inner.nodes.push(url.clone());
-            }
-        }
-        if !leaders.is_empty() {
-            inner.leaders = leaders;
-        }
-        tracing::debug!(
-            nodes = inner.nodes.len(),
-            leaders = inner.leaders.len(),
-            "brain refresh: routing table updated"
+        let applied = self.apply_brain_snapshot(nodes.nodes, placement.shards);
+        tracing::info!(
+            metric.name = "fiducia.lb.brain_refresh",
+            leaders = applied,
+            "refreshed shard leaders from brain"
         );
     }
-}
 
-/// GET a URL and parse the body as JSON. Returns `None` (and logs) on any
-/// transport/status/parse error — a failed refresh just leaves the stale table
-/// in place. Uses `bytes()` so it works without reqwest's optional `json` feature.
-async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<Value> {
-    let resp = match client.get(url).send().await.and_then(|r| r.error_for_status()) {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, url, "brain refresh: request failed");
-            return None;
-        }
-    };
-    match resp.bytes().await {
-        Ok(body) => match serde_json::from_slice(&body) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(error = %e, url, "brain refresh: body not JSON");
-                None
+    fn apply_brain_snapshot(&self, nodes: Vec<BrainNode>, shards: Vec<BrainShard>) -> usize {
+        let mut node_urls_by_id = HashMap::new();
+        let mut node_metadata = HashMap::new();
+        for node in nodes {
+            if !node.health.eq_ignore_ascii_case("healthy") {
+                continue;
             }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, url, "brain refresh: body read failed");
-            None
+            let Some(url) = normalize_node_url(&node.address) else {
+                continue;
+            };
+            node_urls_by_id.insert(node.node_id, url.clone());
+            node_metadata.insert(
+                url,
+                NodeMetadata {
+                    cloud_provider: node.cloud_provider.unwrap_or_default(),
+                    region: node.region.unwrap_or_default(),
+                    cluster_id: node.cluster_id.unwrap_or_default(),
+                },
+            );
         }
+        if node_urls_by_id.is_empty() {
+            tracing::warn!("brain snapshot had no routable healthy nodes");
+            return 0;
+        }
+
+        let mut leaders = HashMap::new();
+        for shard in shards {
+            let target = shard
+                .preferred_leader
+                .as_ref()
+                .and_then(|leader| node_urls_by_id.get(leader))
+                .or_else(|| {
+                    shard
+                        .replicas
+                        .iter()
+                        .find_map(|replica| node_urls_by_id.get(replica))
+                });
+            if let Some(url) = target {
+                leaders.insert(shard.shard_id, url.clone());
+            }
+        }
+        if leaders.is_empty() {
+            tracing::warn!("brain snapshot had no shard leaders");
+            return 0;
+        }
+
+        let mut nodes: Vec<String> = node_urls_by_id.values().cloned().collect();
+        nodes.sort();
+        let applied = leaders.len();
+        let mut inner = self.inner.write().unwrap();
+        inner.nodes = nodes;
+        inner.node_metadata = node_metadata;
+        inner.leaders = leaders;
+        applied
     }
 }
 
-/// Ensure a node address carries a scheme; the brain reports bare `host:port`.
-fn normalize_url(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
+fn brain_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(duration_from_env(
+                "FIDUCIA_BRAIN_REFRESH_TIMEOUT_SECS",
+                DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS,
+            ))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn duration_from_env(name: &str, default_secs: u64) -> Duration {
+    duration_from_secs_value(std::env::var(name).ok().as_deref(), default_secs)
+}
+
+fn duration_from_secs_value(value: Option<&str>, default_secs: u64) -> Duration {
+    let secs = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
+#[derive(Debug, Deserialize)]
+struct BrainNodes {
+    nodes: Vec<BrainNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrainNode {
+    node_id: String,
+    #[serde(default)]
+    address: String,
+    #[serde(default)]
+    health: String,
+    #[serde(default)]
+    cloud_provider: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    cluster_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrainPlacement {
+    shards: Vec<BrainShard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrainShard {
+    shard_id: ShardId,
+    #[serde(default)]
+    replicas: Vec<String>,
+    #[serde(default)]
+    preferred_leader: Option<String>,
+}
+
+fn normalize_node_url(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty() {
+        None
+    } else if address.starts_with("http://") || address.starts_with("https://") {
+        Some(address.trim_end_matches('/').to_string())
     } else {
-        format!("http://{addr}")
+        Some(format!("http://{}", address.trim_end_matches('/')))
     }
 }
 
@@ -292,9 +386,85 @@ mod tests {
     }
 
     #[test]
-    fn normalize_url_adds_scheme_only_when_missing() {
-        assert_eq!(normalize_url("10.0.0.1:8090"), "http://10.0.0.1:8090");
-        assert_eq!(normalize_url("http://a:8090"), "http://a:8090");
-        assert_eq!(normalize_url("https://a:8090"), "https://a:8090");
+    fn brain_snapshot_sets_preferred_leader_and_node_metadata() {
+        let table = RouteTable::new(4, vec![]);
+        let applied = table.apply_brain_snapshot(
+            vec![
+                BrainNode {
+                    node_id: "a".to_string(),
+                    address: "10.0.0.1:8090".to_string(),
+                    health: "healthy".to_string(),
+                    cloud_provider: Some("aws".to_string()),
+                    region: Some("us-east-1".to_string()),
+                    cluster_id: Some("aws-prod".to_string()),
+                },
+                BrainNode {
+                    node_id: "b".to_string(),
+                    address: "http://10.0.0.2:8090".to_string(),
+                    health: "healthy".to_string(),
+                    cloud_provider: Some("gcp".to_string()),
+                    region: Some("us-central1".to_string()),
+                    cluster_id: Some("gcp-prod".to_string()),
+                },
+            ],
+            vec![BrainShard {
+                shard_id: 2,
+                replicas: vec!["a".to_string(), "b".to_string()],
+                preferred_leader: Some("b".to_string()),
+            }],
+        );
+
+        assert_eq!(applied, 1);
+        assert_eq!(table.leader_for(2).as_deref(), Some("http://10.0.0.2:8090"));
+        let snapshot = table.snapshot();
+        assert_eq!(snapshot["node_metadata"][0]["cloud_provider"], "aws");
+        assert_eq!(snapshot["node_metadata"][0]["cluster_id"], "aws-prod");
+        assert_eq!(snapshot["node_metadata"][1]["region"], "us-central1");
+    }
+
+    #[test]
+    fn region_requests_are_counted_by_leader_region() {
+        let table = RouteTable::new(1, vec![]);
+        table.apply_brain_snapshot(
+            vec![BrainNode {
+                node_id: "a".to_string(),
+                address: "10.0.0.1:8090".to_string(),
+                health: "healthy".to_string(),
+                cloud_provider: Some("aws".to_string()),
+                region: Some("us-east-1".to_string()),
+                cluster_id: Some("aws-prod".to_string()),
+            }],
+            vec![BrainShard {
+                shard_id: 0,
+                replicas: vec!["a".to_string()],
+                preferred_leader: Some("a".to_string()),
+            }],
+        );
+
+        table.record_region_request("http://10.0.0.1:8090");
+        table.record_region_request("http://10.0.0.1:8090");
+
+        let snapshot = table.snapshot();
+        assert_eq!(
+            snapshot["metrics"]["region_requests"][0]["region"],
+            "us-east-1"
+        );
+        assert_eq!(snapshot["metrics"]["region_requests"][0]["requests"], 2);
+    }
+
+    #[test]
+    fn brain_refresh_timeout_rejects_invalid_or_zero_values() {
+        assert_eq!(
+            duration_from_secs_value(Some("7"), DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            duration_from_secs_value(Some("0"), DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS),
+            Duration::from_secs(DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            duration_from_secs_value(Some("not-a-number"), DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS),
+            Duration::from_secs(DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS)
+        );
     }
 }
