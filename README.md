@@ -2,9 +2,8 @@
 
 The **edge, key-aware load balancer** for [fiducia.cloud](https://fiducia.cloud).
 End clients speak **HTTP or HTTPS** to this service; it routes each request to the
-**leader of the shard that owns the request's key**. This repository is a
-**skeleton**: routing decisions and the redirect loop are real; byte-level
-forwarding and the control-plane refresh are stubbed.
+**leader of the shard that owns the request's key**. It handles byte-level
+forwarding, `NotLeader` redirects, and control-plane refresh from `fiducia-brain`.
 
 ## Why it exists
 
@@ -45,6 +44,18 @@ key to a shard, forwards to the best-known leader, and learns a newer leader fro
 node `NotLeader` redirects. If a follower cannot name the leader, the LB falls
 back to the known-node round-robin pool.
 
+Auth is still checked at the LB boundary. The public edge should reject most bad
+traffic first, but the regional LB re-validates before proxying to nodes:
+
+- Fiducia API keys (`fdc_live_<id>.<secret>`) are introspected through
+  `fiducia-auth` and cached briefly by SHA-256 credential hash.
+- Fiducia-issued JWTs are verified offline through the auth server's JWKS.
+- Supabase sessions are not a data-plane credential here. Supabase belongs in
+  `fiducia-auth` for dashboard/control-plane login and background sync.
+- Raw `Authorization` / `x-api-key` headers are stripped before the node hop.
+  Nodes only see LB-injected `x-fiducia-auth-kind`, `x-fiducia-org-id`,
+  `x-fiducia-key-id`, and `x-fiducia-scopes`.
+
 TLS termination can happen at this LB: set `FIDUCIA_TLS_CERT_PATH` and
 `FIDUCIA_TLS_KEY_PATH` and it will listen on `TLS_PORT` (default `8443`) with
 Rustls while continuing to serve plain HTTP on `PORT` for in-cluster health
@@ -80,6 +91,7 @@ commit.)
 | File             | Responsibility                                                  |
 |------------------|----------------------------------------------------------------|
 | `src/main.rs`    | axum wiring, refresh task, debug endpoints                      |
+| `src/auth.rs`    | API-key introspection cache + Fiducia JWT offline verify         |
 | `src/routing.rs` | key-from-path extraction + shard hash (mirrors the node)        |
 | `src/table.rs`   | `shard → leader` cache; `note_leader` on redirect; brain refresh|
 | `src/proxy.rs`   | forward + `NotLeader` redirect/retry loop                       |
@@ -97,8 +109,20 @@ curl 'localhost:8088/_lb/resolve?path=/v1/locks/checkout'
 curl  localhost:8088/_lb/routes
 ```
 
-Env: `PORT`, `FIDUCIA_SHARD_COUNT`, `FIDUCIA_NODES` (comma-separated node URLs),
-`FIDUCIA_BRAIN_URL`, `FIDUCIA_TLS_CERT_PATH`, `FIDUCIA_TLS_KEY_PATH`, `TLS_PORT`.
+Env:
+
+- `PORT`, `FIDUCIA_SHARD_COUNT`, `FIDUCIA_NODES` (comma-separated node URLs),
+  `FIDUCIA_BRAIN_URL`
+- `FIDUCIA_BRAIN_REFRESH_TIMEOUT_SECS` — defaults to `2`
+- `FIDUCIA_AUTH_REQUIRED` — set `true` in production once `fiducia-auth` is
+  deployed beside the LB.
+- `FIDUCIA_AUTH_URL` — defaults to
+  `http://fiducia-auth.fiducia.svc.cluster.local:8097`.
+- `FIDUCIA_AUTH_CACHE_TTL_SECS` / `FIDUCIA_AUTH_NEGATIVE_CACHE_TTL_SECS`
+- `FIDUCIA_AUTH_JWKS_URL`, `FIDUCIA_AUTH_JWKS_TTL_SECS`,
+  `FIDUCIA_AUTH_JWT_CACHE_TTL_SECS`
+- `FIDUCIA_JWT_ISSUER` / `FIDUCIA_JWT_AUDIENCE`
+- `FIDUCIA_TLS_CERT_PATH`, `FIDUCIA_TLS_KEY_PATH`, `TLS_PORT`
 
 ## Related
 

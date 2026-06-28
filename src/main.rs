@@ -13,10 +13,11 @@
 //!   * **node ↔ node** (Raft replication) — a persistent, multiplexed streaming
 //!     transport (gRPC/raw TCP), **not** this. See `fiducia-node`'s `Transport`.
 //!
-//! The forwarding path follows node `NotLeader` redirects and self-corrects its
-//! cache; the control-plane refresh is still stubbed (see `table.rs`). The LB is
-//! stateless, so run as many instances as you like behind a plain L4 balancer.
+//! The forwarding path follows node `NotLeader` redirects, self-corrects its
+//! cache, and refreshes placement from the control plane. The LB is stateless,
+//! so run as many instances as you like behind a plain L4 balancer.
 
+mod auth;
 mod proxy;
 mod routing;
 mod table;
@@ -29,7 +30,7 @@ use axum::{
     body::Bytes,
     extract::{Query, State},
     http::{HeaderMap, Method, Uri},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -51,6 +52,11 @@ struct TlsSettings {
     cert_path: String,
     key_path: String,
     port: u16,
+}
+
+struct AppState {
+    auth: auth::AuthState,
+    routes: Arc<RouteTable>,
 }
 
 #[tokio::main]
@@ -79,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::env::var("FIDUCIA_BRAIN_URL").unwrap_or_else(|_| "http://localhost:8095".to_string());
 
     let table = Arc::new(RouteTable::new(shard_count, nodes));
+    let auth = auth::AuthState::from_env();
 
     // Background: keep the shard→leader map fresh from the control plane.
     {
@@ -92,7 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    let app = build_app(table);
+    let app = build_app(Arc::new(AppState {
+        auth,
+        routes: table,
+    }));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -115,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn build_app(table: Arc<RouteTable>) -> Router {
+fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         // LB's own liveness (not proxied).
         .route("/healthz", get(healthz))
@@ -125,7 +135,7 @@ fn build_app(table: Arc<RouteTable>) -> Router {
         .route("/_lb/resolve", get(resolve))
         // Everything else is a client request to be routed to a shard leader.
         .fallback(proxy_fallback)
-        .with_state(table)
+        .with_state(state)
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — the LB proxies long-poll/blocking acquires.
         .layer(TraceLayer::new_for_http())
@@ -148,11 +158,8 @@ async fn serve_https(
     app: Router,
     tls: TlsSettings,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-        tls.cert_path,
-        tls.key_path,
-    )
-    .await?;
+    let config =
+        axum_server::tls_rustls::RustlsConfig::from_pem_file(tls.cert_path, tls.key_path).await?;
     tracing::info!("{SERVICE} listening on https://{addr}");
     axum_server::bind_rustls(addr, config)
         .serve(app.into_make_service())
@@ -186,18 +193,26 @@ async fn healthz() -> Json<Value> {
 
 /// Catch-all: route a client request to the owning shard's leader.
 async fn proxy_fallback(
-    State(table): State<Arc<RouteTable>>,
+    State(state): State<Arc<AppState>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    proxy::route(table, method, uri, headers, body).await
+    match state.auth.authenticate(&headers).await {
+        Ok(identity) => {
+            proxy::route(state.routes.clone(), identity, method, uri, headers, body).await
+        }
+        Err(response) => response,
+    }
 }
 
 /// `GET /_lb/routes` — dump the current shard→leader cache.
-async fn routes_dump(State(table): State<Arc<RouteTable>>) -> Json<Value> {
-    Json(table.snapshot())
+async fn routes_dump(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match state.auth.authenticate(&headers).await {
+        Ok(_) => Json(state.routes.snapshot()).into_response(),
+        Err(response) => response,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,15 +224,21 @@ struct ResolveParams {
 /// forwarding. Handy for verifying key extraction and shard math. The `path`
 /// value may include a query string (e.g. the KV `?key=`).
 async fn resolve(
-    State(table): State<Arc<RouteTable>>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(p): Query<ResolveParams>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(response) = state.auth.authenticate(&headers).await {
+        return response;
+    }
     let uri: Uri = p.path.parse().unwrap_or_default();
     let key = routing_key(&uri);
-    let shard = key.as_ref().map(|k| shard_for(k, table.shard_count()));
+    let shard = key
+        .as_ref()
+        .map(|k| shard_for(k, state.routes.shard_count()));
     let target = match shard {
-        Some(s) => table.leader_for(s),
-        None => table.any_node(),
+        Some(s) => state.routes.leader_for(s),
+        None => state.routes.any_node(),
     };
     Json(json!({
         "path": p.path,
@@ -225,6 +246,7 @@ async fn resolve(
         "shard": shard,
         "target": target,
     }))
+    .into_response()
 }
 
 #[cfg(test)]

@@ -27,10 +27,9 @@
 use axum::http::Uri;
 
 // Single source of truth for `ShardId`, the hash, and coordination keys.
-pub use fiducia_routing::{
-    lock_coordination_shard, service_discovery_shard, shard_for, ShardId, LOCK_COORDINATION_KEY,
-    SERVICE_DISCOVERY_KEY,
-};
+#[cfg(test)]
+pub use fiducia_routing::{lock_coordination_shard, service_discovery_shard};
+pub use fiducia_routing::{shard_for, ShardId, LOCK_COORDINATION_KEY, SERVICE_DISCOVERY_KEY};
 
 /// Extract the routing key from a request, mirroring the node's API shape.
 ///
@@ -66,7 +65,8 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
 }
 
 /// Hash a request straight to its shard, or `None` for keyless requests.
-pub fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
+#[cfg(test)]
+fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
     routing_key(uri).map(|key| shard_for(&key, shard_count))
 }
 
