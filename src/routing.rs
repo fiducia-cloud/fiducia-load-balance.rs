@@ -57,9 +57,10 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
         ["v1", "cron", "schedules", name, ..] => Some(percent_decode(name)),
         // Elections: /v1/elections/{name}/... → name.
         ["v1", "elections", name, ..] => Some(percent_decode(name)),
-        // Service discovery routes through one registry coordinator so service
-        // names can be listed linearizably without cross-shard scatter-gather.
-        ["v1", "services", ..] => Some(SERVICE_DISCOVERY_KEY.to_string()),
+        // Service discovery routes per service name (each service's instances live
+        // on one shard, so per-service ops are single-shard). Listing *all*
+        // services has no single key → any node fans out across shards.
+        ["v1", "services", service, ..] => Some(percent_decode(service)),
         // status / health / unknown → any node.
         _ => None,
     }
