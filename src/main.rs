@@ -117,6 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn build_app(table: Arc<RouteTable>) -> Router {
+    // Edge auth (offline JWT verify + cached introspection). Permissive unless
+    // FIDUCIA_AUTH_MODE=enforce, so this rolls out without breaking clients.
+    let authn = Arc::new(auth::Authenticator::from_env());
     Router::new()
         // LB's own liveness (not proxied).
         .route("/healthz", get(healthz))
@@ -126,6 +129,7 @@ fn build_app(table: Arc<RouteTable>) -> Router {
         .route("/_lb/resolve", get(resolve))
         // Everything else is a client request to be routed to a shard leader.
         .fallback(proxy_fallback)
+        .layer(axum::Extension(authn))
         .with_state(table)
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — the LB proxies long-poll/blocking acquires.
