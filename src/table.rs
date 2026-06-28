@@ -137,23 +137,8 @@ impl RouteTable {
         }
 
         // 2. placement -> per-shard preferred leader (or first replica).
-        let placement_doc: Value = match client
-            .get(format!("{base}/v1/placement"))
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            Ok(resp) => match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "brain refresh: /v1/placement body not JSON");
-                    return;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, brain = %base, "brain refresh: /v1/placement unreachable");
-                return;
-            }
+        let Some(placement_doc) = fetch_json(&client, &format!("{base}/v1/placement")).await else {
+            return;
         };
 
         let mut leaders: HashMap<ShardId, String> = HashMap::new();
