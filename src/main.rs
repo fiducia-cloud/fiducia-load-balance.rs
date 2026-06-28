@@ -17,6 +17,7 @@
 //! cache; the control-plane refresh is still stubbed (see `table.rs`). The LB is
 //! stateless, so run as many instances as you like behind a plain L4 balancer.
 
+mod auth;
 mod proxy;
 mod routing;
 mod table;
