@@ -14,7 +14,8 @@
 //! | `/v1/rate-limit/{tenant}/{key}/...`      | `{key}`                             |
 //! | `/v1/cron/schedules/{name}/...`          | `{name}`                            |
 //! | `/v1/elections/{name}/...`               | `{name}`                            |
-//! | `/v1/services...`                        | **`SERVICE_DISCOVERY_KEY`**         |
+//! | `/v1/services/{service}/...`             | `{service}`                         |
+//! | `/v1/services` (list all)                | none (any node fans out)            |
 //! | `/v1/kv` (no key), `/v1/status`, health  | none (any node)                     |
 //!
 //! **Locks/semaphores never route by their user key.** A multi-key *union* lock
@@ -28,8 +29,7 @@ use axum::http::Uri;
 
 // Single source of truth for `ShardId`, the hash, and coordination keys.
 pub use fiducia_routing::{
-    lock_coordination_shard, service_discovery_shard, shard_for, ShardId, LOCK_COORDINATION_KEY,
-    SERVICE_DISCOVERY_KEY,
+    lock_coordination_shard, shard_for, ShardId, LOCK_COORDINATION_KEY,
 };
 
 /// Extract the routing key from a request, mirroring the node's API shape.
@@ -57,9 +57,10 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
         ["v1", "cron", "schedules", name, ..] => Some(percent_decode(name)),
         // Elections: /v1/elections/{name}/... → name.
         ["v1", "elections", name, ..] => Some(percent_decode(name)),
-        // Service discovery routes through one registry coordinator so service
-        // names can be listed linearizably without cross-shard scatter-gather.
-        ["v1", "services", ..] => Some(SERVICE_DISCOVERY_KEY.to_string()),
+        // Service discovery routes per service name (each service's instances live
+        // on one shard, so per-service ops are single-shard). Listing *all*
+        // services has no single key → any node fans out across shards.
+        ["v1", "services", service, ..] => Some(percent_decode(service)),
         // status / health / unknown → any node.
         _ => None,
     }
@@ -179,20 +180,23 @@ mod tests {
     }
 
     #[test]
-    fn service_discovery_routes_to_the_registry_coordinator() {
+    fn service_discovery_routes_per_service_name() {
+        // Per-service ops route by the service name (one shard owns a service's
+        // whole instance set), matching the node's `Command::routing_key`.
         for p in [
-            "/v1/services",
             "/v1/services/api",
             "/v1/services/api/instances/i1",
             "/v1/services/api/watch",
         ] {
-            assert_eq!(key(p).as_deref(), Some(SERVICE_DISCOVERY_KEY));
+            assert_eq!(key(p).as_deref(), Some("api"));
         }
         for n in [4u32, 16, 256] {
             assert_eq!(
                 shard_for_request(&uri("/v1/services/api/instances/i1"), n).unwrap(),
-                service_discovery_shard(n)
+                shard_for("api", n)
             );
         }
+        // Listing *all* services has no single key — any node fans out.
+        assert_eq!(key("/v1/services"), None);
     }
 }
