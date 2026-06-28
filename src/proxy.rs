@@ -61,6 +61,7 @@ pub async fn route(
     };
 
     let Some(target) = target else {
+        tracing::warn!(shard = ?shard, "lb: no known node for this request — returning 503");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "no_route", "detail": "no known node for this request", "shard": shard })),
@@ -68,6 +69,7 @@ pub async fn route(
             .into_response();
     };
 
+    tracing::debug!(shard = ?shard, target = %target, "lb: forwarding to node");
     forward_with_redirect(table, target, shard, method, uri, headers, body).await
 }
 
