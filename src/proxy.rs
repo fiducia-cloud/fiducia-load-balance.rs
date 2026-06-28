@@ -23,6 +23,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::auth::{should_strip_client_auth_header, VerifiedIdentity};
 use crate::routing::{routing_key, shard_for, ShardId};
 use crate::table::RouteTable;
 
@@ -45,6 +46,7 @@ enum Upstream {
 #[tracing::instrument(name = "lb.route", skip_all, fields(method = %method, path = %uri.path()))]
 pub async fn route(
     table: Arc<RouteTable>,
+    identity: Option<VerifiedIdentity>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -70,12 +72,13 @@ pub async fn route(
     };
 
     tracing::debug!(shard = ?shard, target = %target, "lb: forwarding to node");
-    forward_with_redirect(table, target, shard, method, uri, headers, body).await
+    forward_with_redirect(table, identity, target, shard, method, uri, headers, body).await
 }
 
 /// Forward to `target`, following `NotLeader` redirects up to [`MAX_HOPS`].
 async fn forward_with_redirect(
     table: Arc<RouteTable>,
+    identity: Option<VerifiedIdentity>,
     mut target: String,
     shard: Option<ShardId>,
     method: Method,
@@ -84,7 +87,17 @@ async fn forward_with_redirect(
     body: Bytes,
 ) -> Response {
     for hop in 0..MAX_HOPS {
-        match forward_once(&target, &method, &uri, &headers, body.clone()).await {
+        table.record_region_request(&target);
+        match forward_once(
+            &target,
+            identity.as_ref(),
+            &method,
+            &uri,
+            &headers,
+            body.clone(),
+        )
+        .await
+        {
             Upstream::Served(resp) => {
                 if hop > 0 {
                     tracing::debug!(shard = ?shard, hops = hop, target = %target, "lb: served after redirect/retry");
@@ -158,6 +171,7 @@ fn proxy_client() -> &'static reqwest::Client {
 /// LB updates its stale shard→leader cache and retries the request.
 async fn forward_once(
     node_url: &str,
+    identity: Option<&VerifiedIdentity>,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
@@ -173,7 +187,7 @@ async fn forward_once(
     let client = proxy_client();
     let mut request = client.request(method, url).body(body);
     for (name, value) in headers {
-        if is_hop_by_hop(name.as_str()) {
+        if is_hop_by_hop(name.as_str()) || should_strip_client_auth_header(name.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -181,6 +195,15 @@ async fn forward_once(
             reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
         ) {
             request = request.header(name, value);
+        }
+    }
+    if let Some(identity) = identity {
+        request = request
+            .header("x-fiducia-auth-kind", identity.kind_header())
+            .header("x-fiducia-org-id", identity.org_id.as_str())
+            .header("x-fiducia-scopes", identity.scopes_header());
+        if let Some(key_id) = identity.key_id.as_deref() {
+            request = request.header("x-fiducia-key-id", key_id);
         }
     }
 
@@ -359,6 +382,37 @@ mod tests {
             table.leader_for(3).as_deref(),
             Some("http://new-leader:8090")
         );
+    }
+
+    #[tokio::test]
+    async fn retries_a_down_known_node_against_another_known_node() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_node = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async { (StatusCode::OK, "live node") });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let live_node = format!("http://{addr}");
+        let table = Arc::new(RouteTable::new(4, vec![dead_node.clone(), live_node]));
+        let response = forward_with_redirect(
+            table,
+            None,
+            dead_node,
+            Some(0),
+            Method::GET,
+            "/v1/status".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
