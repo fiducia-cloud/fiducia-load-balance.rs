@@ -56,6 +56,16 @@ traffic first, but the regional LB re-validates before proxying to nodes:
   Nodes only see LB-injected `x-fiducia-auth-kind`, `x-fiducia-org-id`,
   `x-fiducia-key-id`, and `x-fiducia-scopes`.
 
+Customer-facing idempotency is enforced at this boundary too. Mutating requests
+(`POST`, `PUT`, `PATCH`, `DELETE`) may include `Idempotency-Key: <key>`.
+The LB hashes the customer key with the authenticated org, claims an internal
+`/v1/idempotency` record, forwards the mutation once, then stores a replayable
+status/body result for 24 hours. Exact retries replay the original response with
+`Idempotent-Replayed: true`; the same key with a different method/path/body
+returns `409 idempotency_key_conflict`; a retry while the first request is still
+running returns `409 idempotency_key_in_progress` and `Retry-After: 1`. The raw
+customer header is consumed at the LB and is not forwarded to nodes.
+
 TLS termination can happen at this LB: set `FIDUCIA_TLS_CERT_PATH` and
 `FIDUCIA_TLS_KEY_PATH` and it will listen on `TLS_PORT` (default `8443`) with
 Rustls while continuing to serve plain HTTP on `PORT` for in-cluster health
