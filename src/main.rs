@@ -192,11 +192,17 @@ async fn healthz() -> Json<Value> {
 /// Catch-all: route a client request to the owning shard's leader.
 async fn proxy_fallback(
     State(table): State<Arc<RouteTable>>,
+    axum::Extension(authn): axum::Extension<Arc<auth::Authenticator>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Authenticate, strip spoofed identity, tag with trusted org/scopes — or 401.
+    let headers = match authn.authorize(&uri, headers).await {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
     proxy::route(table, method, uri, headers, body).await
 }
 
