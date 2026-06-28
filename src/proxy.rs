@@ -225,6 +225,12 @@ async fn forward_once(
             request = request.header("x-fiducia-key-id", key_id);
         }
     }
+    // Prove to the node that this request comes from the LB (a trusted hop), so
+    // it can trust the identity headers above. The matching client-supplied header
+    // is stripped by `should_strip_client_auth_header`, so a caller can't forge it.
+    if let Some(secret) = internal_secret() {
+        request = request.header(INTERNAL_AUTH_HEADER, secret);
+    }
 
     let Ok(response) = request.send().await else {
         return Upstream::Unreachable;
