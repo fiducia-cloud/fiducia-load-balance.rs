@@ -180,20 +180,23 @@ mod tests {
     }
 
     #[test]
-    fn service_discovery_routes_to_the_registry_coordinator() {
+    fn service_discovery_routes_per_service_name() {
+        // Per-service ops route by the service name (one shard owns a service's
+        // whole instance set), matching the node's `Command::routing_key`.
         for p in [
-            "/v1/services",
             "/v1/services/api",
             "/v1/services/api/instances/i1",
             "/v1/services/api/watch",
         ] {
-            assert_eq!(key(p).as_deref(), Some(SERVICE_DISCOVERY_KEY));
+            assert_eq!(key(p).as_deref(), Some("api"));
         }
         for n in [4u32, 16, 256] {
             assert_eq!(
                 shard_for_request(&uri("/v1/services/api/instances/i1"), n).unwrap(),
-                service_discovery_shard(n)
+                shard_for("api", n)
             );
         }
+        // Listing *all* services has no single key — any node fans out.
+        assert_eq!(key("/v1/services"), None);
     }
 }
