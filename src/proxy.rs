@@ -140,6 +140,16 @@ fn proxy_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            // Bounded timeouts so an UNRESPONSIVE (frozen, not crashed) node is
+            // shed quickly: a frozen leader keeps its TCP socket open, so without
+            // a request timeout the LB would hang on it forever instead of failing
+            // over to the new leader. Connect timeout catches a truly dead host
+            // fast; the request timeout catches the connected-but-silent case.
+            // NOTE: these bound EVERY proxied request, so when real long-poll lock
+            // waits / KV watch streams land, route those through a separate
+            // long-timeout client.
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
