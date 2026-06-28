@@ -29,8 +29,7 @@ use axum::http::Uri;
 
 // Single source of truth for `ShardId`, the hash, and coordination keys.
 pub use fiducia_routing::{
-    lock_coordination_shard, service_discovery_shard, shard_for, ShardId, LOCK_COORDINATION_KEY,
-    SERVICE_DISCOVERY_KEY,
+    lock_coordination_shard, shard_for, ShardId, LOCK_COORDINATION_KEY,
 };
 
 /// Extract the routing key from a request, mirroring the node's API shape.
