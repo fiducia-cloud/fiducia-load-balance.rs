@@ -83,16 +83,23 @@ async fn forward_with_redirect(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    for _ in 0..MAX_HOPS {
+    for hop in 0..MAX_HOPS {
         match forward_once(&target, &method, &uri, &headers, body.clone()).await {
-            Upstream::Served(resp) => return resp,
+            Upstream::Served(resp) => {
+                if hop > 0 {
+                    tracing::debug!(shard = ?shard, hops = hop, target = %target, "lb: served after redirect/retry");
+                }
+                return resp;
+            }
             Upstream::NotLeader {
                 leader: Some(leader),
             } => {
+                tracing::info!(shard = ?shard, hop, from = %target, to = %leader, "lb: follower redirect — retrying leader, refreshing cache");
                 target = redirected_leader_target(&table, shard, leader);
             }
             Upstream::NotLeader { leader: None } | Upstream::Unreachable => {
                 // No hint / dead node: pick another and retry.
+                tracing::warn!(shard = ?shard, hop, target = %target, "lb: node unreachable / no leader hint — failing over to another node");
                 match table.any_node() {
                     Some(next) => target = next,
                     None => break,
@@ -100,6 +107,7 @@ async fn forward_with_redirect(
             }
         }
     }
+    tracing::error!(shard = ?shard, max_hops = MAX_HOPS, "lb: exhausted redirects/retries — returning 502");
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({ "error": "no_leader", "detail": "exhausted redirects/retries" })),
