@@ -104,23 +104,8 @@ impl RouteTable {
         let client = reqwest::Client::new();
 
         // 1. node_id -> base URL, for healthy nodes only.
-        let nodes_doc: Value = match client
-            .get(format!("{base}/v1/nodes"))
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            Ok(resp) => match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "brain refresh: /v1/nodes body not JSON");
-                    return;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, brain = %base, "brain refresh: /v1/nodes unreachable");
-                return;
-            }
+        let Some(nodes_doc) = fetch_json(&client, &format!("{base}/v1/nodes")).await else {
+            return;
         };
 
         let mut node_url: HashMap<String, String> = HashMap::new();
