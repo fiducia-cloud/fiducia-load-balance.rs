@@ -17,6 +17,7 @@
 //! cache; the control-plane refresh is still stubbed (see `table.rs`). The LB is
 //! stateless, so run as many instances as you like behind a plain L4 balancer.
 
+mod auth;
 mod proxy;
 mod routing;
 mod table;
@@ -116,6 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn build_app(table: Arc<RouteTable>) -> Router {
+    // Edge auth (offline JWT verify + cached introspection). Permissive unless
+    // FIDUCIA_AUTH_MODE=enforce, so this rolls out without breaking clients.
+    let authn = Arc::new(auth::Authenticator::from_env());
     Router::new()
         // LB's own liveness (not proxied).
         .route("/healthz", get(healthz))
@@ -125,6 +129,7 @@ fn build_app(table: Arc<RouteTable>) -> Router {
         .route("/_lb/resolve", get(resolve))
         // Everything else is a client request to be routed to a shard leader.
         .fallback(proxy_fallback)
+        .layer(axum::Extension(authn))
         .with_state(table)
         // Hardening (outermost last): catch handler panics → 500 and cap body
         // size. No TimeoutLayer — the LB proxies long-poll/blocking acquires.
@@ -187,11 +192,17 @@ async fn healthz() -> Json<Value> {
 /// Catch-all: route a client request to the owning shard's leader.
 async fn proxy_fallback(
     State(table): State<Arc<RouteTable>>,
+    axum::Extension(authn): axum::Extension<Arc<auth::Authenticator>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Authenticate, strip spoofed identity, tag with trusted org/scopes — or 401.
+    let headers = match authn.authorize(&uri, headers).await {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
     proxy::route(table, method, uri, headers, body).await
 }
 
