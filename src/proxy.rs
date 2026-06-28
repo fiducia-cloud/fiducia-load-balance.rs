@@ -81,6 +81,7 @@ async fn forward_with_redirect(
     body: Bytes,
 ) -> Response {
     for _ in 0..MAX_HOPS {
+        table.record_region_request(&target);
         match forward_once(&target, &method, &uri, &headers, body.clone()).await {
             Upstream::Served(resp) => return resp,
             Upstream::NotLeader {

@@ -2,9 +2,8 @@
 
 The **edge, key-aware load balancer** for [fiducia.cloud](https://fiducia.cloud).
 End clients speak **HTTP** to this service; it routes each request to the
-**leader of the shard that owns the request's key**. This repository is a
-**skeleton**: routing decisions and the redirect loop are real; byte-level
-forwarding and the control-plane refresh are stubbed.
+**leader of the shard that owns the request's key**. It handles byte-level
+forwarding, `NotLeader` redirects, and control-plane refresh from `fiducia-brain`.
 
 ## Why it exists
 

@@ -13,9 +13,9 @@
 //!   * **node ↔ node** (Raft replication) — a persistent, multiplexed streaming
 //!     transport (gRPC/raw TCP), **not** this. See `fiducia-node`'s `Transport`.
 //!
-//! The forwarding path follows node `NotLeader` redirects and self-corrects its
-//! cache; the control-plane refresh is still stubbed (see `table.rs`). The LB is
-//! stateless, so run as many instances as you like behind a plain L4 balancer.
+//! The forwarding path follows node `NotLeader` redirects, self-corrects its
+//! cache, and refreshes placement from the control plane. The LB is stateless,
+//! so run as many instances as you like behind a plain L4 balancer.
 
 mod proxy;
 mod routing;
