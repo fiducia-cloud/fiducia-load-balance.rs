@@ -320,6 +320,7 @@ pub fn should_strip_client_auth_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "authorization"
             | "x-api-key"
+            | "cookie"
             | "x-fiducia-auth-kind"
             | "x-fiducia-org-id"
             | "x-fiducia-key-id"
@@ -612,6 +613,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_credential_ignores_empty_bearer_and_blank_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer    ".parse().unwrap());
+        headers.insert("x-api-key", "   ".parse().unwrap());
+
+        assert_eq!(extract_credential(&headers), None);
+    }
+
+    #[test]
     fn classifies_api_keys_and_jwts() {
         assert!(is_api_key("fdc_live_abc.def"));
         assert!(!is_api_key("not-a-key"));
@@ -632,6 +642,7 @@ mod tests {
         for name in [
             "authorization",
             "x-api-key",
+            "cookie",
             "x-fiducia-auth-kind",
             "x-fiducia-org-id",
             "x-fiducia-key-id",

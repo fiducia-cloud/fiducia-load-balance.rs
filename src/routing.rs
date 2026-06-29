@@ -11,6 +11,8 @@
 //! |------------------------------------------|-------------------------------------|
 //! | `GET/PUT/DELETE /v1/kv?key=K`            | `K` (query param — slash-safe)      |
 //! | `/v1/locks/*`, `/v1/semaphores/*`        | **`LOCK_COORDINATION_KEY`** (always — see below) |
+//! | `GET /v1/idempotency?key=K`              | `K` (query param — slash-safe)      |
+//! | `POST /v1/idempotency/{claim,complete}`  | JSON body `key`                     |
 //! | `/v1/rate-limit/{tenant}/{key}/...`      | `{key}`                             |
 //! | `/v1/cron/schedules/{name}/...`          | `{name}`                            |
 //! | `/v1/elections/{name}/...`               | `{name}`                            |
@@ -48,6 +50,8 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
         // Locks + semaphores ALWAYS route to the one lock-coordination shard,
         // regardless of the user key (atomic multi-key union needs one SM).
         ["v1", "locks", ..] | ["v1", "semaphores", ..] => Some(LOCK_COORDINATION_KEY.to_string()),
+        // Idempotency inspection carries the key in the query string.
+        ["v1", "idempotency"] => query_param(uri, "key"),
         // Rate limit: /v1/rate-limit/{tenant}/{key}/... → key.
         ["v1", "rate-limit", _tenant, key, ..] | ["v1", "ratelimit", _tenant, key, ..] => {
             Some(percent_decode(key))
@@ -64,6 +68,24 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
     }
 }
 
+/// Extract a routing key from URI plus body for endpoints whose key is JSON-only.
+pub fn routing_key_with_body(uri: &Uri, body: &[u8]) -> Option<String> {
+    routing_key(uri).or_else(|| {
+        let segs: Vec<&str> = uri
+            .path()
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        match segs.as_slice() {
+            ["v1", "idempotency", "claim"] | ["v1", "idempotency", "complete"] => {
+                json_body_key(body)
+            }
+            _ => None,
+        }
+    })
+}
+
 /// Hash a request straight to its shard, or `None` for keyless requests.
 #[cfg(test)]
 fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
@@ -76,6 +98,11 @@ fn query_param(uri: &Uri, name: &str) -> Option<String> {
         let (k, v) = pair.split_once('=')?;
         (k == name).then(|| percent_decode(v))
     })
+}
+
+fn json_body_key(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("key")?.as_str().map(ToOwned::to_owned)
 }
 
 /// Minimal `application/x-www-form-urlencoded` decode (`+`→space, `%XX`→byte),
@@ -120,6 +147,9 @@ mod tests {
     fn key(s: &str) -> Option<String> {
         routing_key(&uri(s))
     }
+    fn key_with_body(s: &str, body: &[u8]) -> Option<String> {
+        routing_key_with_body(&uri(s), body)
+    }
 
     #[test]
     fn kv_key_comes_from_the_query_param_and_is_slash_safe() {
@@ -131,6 +161,56 @@ mod tests {
         assert_eq!(key("/v1/kv?key=a%2Fb").as_deref(), Some("a/b")); // encoded slash
         assert_eq!(key("/v1/kv?watch=true&key=x").as_deref(), Some("x")); // any position
         assert_eq!(key("/v1/kv"), None); // no key → keyless (list / any node)
+    }
+
+    #[test]
+    fn idempotency_routes_by_query_or_body_key() {
+        assert_eq!(
+            key("/v1/idempotency?key=stripe-webhook/event_123").as_deref(),
+            Some("stripe-webhook/event_123")
+        );
+        assert_eq!(
+            key_with_body(
+                "/v1/idempotency/claim",
+                br#"{"key":"stripe-webhook/event_123","ttl":"24h"}"#
+            )
+            .as_deref(),
+            Some("stripe-webhook/event_123")
+        );
+        assert_eq!(
+            key_with_body(
+                "/v1/idempotency/complete",
+                br#"{"key":"stripe-webhook/event_123","fencing_token":7}"#
+            )
+            .as_deref(),
+            Some("stripe-webhook/event_123")
+        );
+        assert_eq!(key("/v1/idempotency/claim"), None);
+    }
+
+    #[test]
+    fn idempotency_body_routing_rejects_malformed_or_non_string_keys() {
+        assert_eq!(
+            key_with_body("/v1/idempotency/claim", br#"{"key":7}"#),
+            None
+        );
+        assert_eq!(
+            key_with_body("/v1/idempotency/complete", br#"{"owner":"worker"}"#),
+            None
+        );
+        assert_eq!(key_with_body("/v1/idempotency/claim", b"not-json"), None);
+    }
+
+    #[test]
+    fn routing_decodes_plus_and_percent_escapes_in_keys() {
+        assert_eq!(
+            key("/v1/kv?key=tenant+space%2Fcheckout").as_deref(),
+            Some("tenant space/checkout")
+        );
+        assert_eq!(
+            key("/v1/rate-limit/acme/tenant+space%2Fcheckout/check").as_deref(),
+            Some("tenant space/checkout")
+        );
     }
 
     #[test]

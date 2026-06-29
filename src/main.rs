@@ -29,7 +29,7 @@ use std::time::Duration;
 use axum::{
     body::Bytes,
     extract::{Query, State},
-    http::{HeaderMap, Method, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -42,6 +42,7 @@ use routing::{routing_key, shard_for};
 use table::RouteTable;
 
 const SERVICE: &str = "fiducia-load-balance";
+const ADMIN_READ_SCOPES: &[&str] = &["admin:read", "admin:write"];
 
 /// Cap request bodies forwarded through the LB (KV values). NOTE: deliberately
 /// **no request timeout** — the LB proxies blocking lock acquires / long-poll.
@@ -210,7 +211,12 @@ async fn proxy_fallback(
 /// `GET /_lb/routes` — dump the current shard→leader cache.
 async fn routes_dump(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match state.auth.authenticate(&headers).await {
-        Ok(_) => Json(state.routes.snapshot()).into_response(),
+        Ok(identity) => {
+            if authorize_admin_read(identity.as_ref()).is_err() {
+                return insufficient_admin_scope_response();
+            }
+            Json(state.routes.snapshot()).into_response()
+        }
         Err(response) => response,
     }
 }
@@ -228,9 +234,14 @@ async fn resolve(
     headers: HeaderMap,
     Query(p): Query<ResolveParams>,
 ) -> Response {
-    if let Err(response) = state.auth.authenticate(&headers).await {
-        return response;
+    let identity = match state.auth.authenticate(&headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if authorize_admin_read(identity.as_ref()).is_err() {
+        return insufficient_admin_scope_response();
     }
+
     let uri: Uri = p.path.parse().unwrap_or_default();
     let key = routing_key(&uri);
     let shard = key
@@ -247,6 +258,48 @@ async fn resolve(
         "target": target,
     }))
     .into_response()
+}
+
+fn authorize_admin_read(identity: Option<&auth::VerifiedIdentity>) -> Result<(), ()> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+
+    if identity.scopes.iter().any(|scope| {
+        let scope = scope.trim();
+        scope == "*"
+            || ADMIN_READ_SCOPES
+                .iter()
+                .any(|required| scope_matches(scope, required))
+    }) {
+        return Ok(());
+    }
+
+    Err(())
+}
+
+fn scope_matches(granted: &str, required: &str) -> bool {
+    if granted == required {
+        return true;
+    }
+    let Some(prefix) = granted.strip_suffix(":*") else {
+        return false;
+    };
+    required
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn insufficient_admin_scope_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "insufficient_scope",
+            "detail": "credential scope does not permit this operator route",
+            "required_scopes": ADMIN_READ_SCOPES,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -290,5 +343,24 @@ mod interface_contract_tests {
         std::env::remove_var("FIDUCIA_TLS_CERT_PATH");
         std::env::remove_var("FIDUCIA_TLS_KEY_PATH");
         std::env::remove_var("TLS_PORT");
+    }
+
+    #[test]
+    fn lb_operator_routes_require_admin_read_scope_when_authenticated() {
+        assert!(authorize_admin_read(None).is_ok());
+        assert!(authorize_admin_read(Some(&test_identity(&["kv:read"]))).is_err());
+        assert!(authorize_admin_read(Some(&test_identity(&["admin:read"]))).is_ok());
+        assert!(authorize_admin_read(Some(&test_identity(&["admin:write"]))).is_ok());
+        assert!(authorize_admin_read(Some(&test_identity(&["admin:*"]))).is_ok());
+        assert!(authorize_admin_read(Some(&test_identity(&["*"]))).is_ok());
+    }
+
+    fn test_identity(scopes: &[&str]) -> auth::VerifiedIdentity {
+        auth::VerifiedIdentity {
+            kind: auth::AuthKind::ApiKey,
+            org_id: "org_test".to_string(),
+            key_id: Some("key_test".to_string()),
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+        }
     }
 }
