@@ -148,8 +148,12 @@ impl RouteTable {
     pub async fn refresh_from_brain(&self, brain_url: &str) {
         let base = brain_url.trim_end_matches('/');
         let client = brain_client();
-        let nodes = match client
-            .get(format!("{base}/v1/nodes"))
+        // The brain's /v1 enforces the trusted-hop secret when configured.
+        let auth = |req: reqwest::RequestBuilder| match crate::proxy::internal_secret() {
+            Some(secret) => req.header(crate::proxy::INTERNAL_AUTH_HEADER, secret),
+            None => req,
+        };
+        let nodes = match auth(client.get(format!("{base}/v1/nodes")))
             .send()
             .await
             .and_then(|r| r.error_for_status())
