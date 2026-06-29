@@ -119,9 +119,9 @@ impl RouteTable {
         let mut leaders: Vec<_> = inner.leaders.iter().collect();
         leaders.sort_by_key(|(s, _)| **s);
         let mut node_metadata: Vec<_> = inner.node_metadata.iter().collect();
-        node_metadata.sort_by(|(a, _), (b, _)| a.cmp(b));
+        node_metadata.sort_by_key(|(url, _)| *url);
         let mut region_requests: Vec<_> = inner.region_requests.iter().collect();
-        region_requests.sort_by(|(a, _), (b, _)| a.cmp(b));
+        region_requests.sort_by_key(|(region, _)| *region);
         json!({
             "shard_count": self.shard_count,
             "nodes": inner.nodes,
