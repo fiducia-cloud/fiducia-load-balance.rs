@@ -170,8 +170,7 @@ impl RouteTable {
                 return;
             }
         };
-        let placement = match client
-            .get(format!("{base}/v1/placement"))
+        let placement = match auth(client.get(format!("{base}/v1/placement")))
             .send()
             .await
             .and_then(|r| r.error_for_status())
