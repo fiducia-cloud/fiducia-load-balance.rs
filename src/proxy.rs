@@ -30,6 +30,25 @@ use crate::table::RouteTable;
 /// Max redirect/retry hops before giving up (defeats redirect loops).
 const MAX_HOPS: usize = 4;
 
+/// Trusted-hop header carrying the shared cluster secret to the node. The node
+/// requires it on `/v1` when `FIDUCIA_INTERNAL_SECRET` is set, so only the LB
+/// (and peer nodes) — not a direct caller — can present injected identity.
+const INTERNAL_AUTH_HEADER: &str = "x-fiducia-internal-auth";
+
+/// The shared internal secret, read once. `None` (unset/blank) means the node
+/// guard is also off, so we send nothing.
+fn internal_secret() -> Option<&'static str> {
+    static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            std::env::var("FIDUCIA_INTERNAL_SECRET")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
 /// What a single upstream attempt told us.
 #[derive(Debug)]
 enum Upstream {
@@ -205,6 +224,12 @@ async fn forward_once(
         if let Some(key_id) = identity.key_id.as_deref() {
             request = request.header("x-fiducia-key-id", key_id);
         }
+    }
+    // Prove to the node that this request comes from the LB (a trusted hop), so
+    // it can trust the identity headers above. The matching client-supplied header
+    // is stripped by `should_strip_client_auth_header`, so a caller can't forge it.
+    if let Some(secret) = internal_secret() {
+        request = request.header(INTERNAL_AUTH_HEADER, secret);
     }
 
     let Ok(response) = request.send().await else {

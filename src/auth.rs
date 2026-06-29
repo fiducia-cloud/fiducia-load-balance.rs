@@ -324,6 +324,9 @@ pub fn should_strip_client_auth_header(name: &str) -> bool {
             | "x-fiducia-org-id"
             | "x-fiducia-key-id"
             | "x-fiducia-scopes"
+            // The trusted-hop secret to the node: only the LB may set it, never a
+            // client. The LB re-attaches its own in `proxy::forward_once`.
+            | "x-fiducia-internal-auth"
     )
 }
 
@@ -633,6 +636,8 @@ mod tests {
             "x-fiducia-org-id",
             "x-fiducia-key-id",
             "x-fiducia-scopes",
+            "x-fiducia-internal-auth",
+            "X-Fiducia-Internal-Auth",
         ] {
             assert!(should_strip_client_auth_header(name));
         }
