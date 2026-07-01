@@ -86,14 +86,15 @@ const SERVICES_READ_SCOPES: &[&str] = &[
 ];
 const SERVICES_WRITE_SCOPES: &[&str] = &["services:write", "admin:write"];
 
-/// Trusted-hop header carrying the shared cluster secret to the node. The node
-/// requires it on `/v1` when `FIDUCIA_INTERNAL_SECRET` is set, so only the LB
+/// Trusted-hop header carrying the shared cluster secret to the node/brain. They
+/// require it on `/v1` when `FIDUCIA_INTERNAL_SECRET` is set, so only the LB
 /// (and peer nodes) — not a direct caller — can present injected identity.
-const INTERNAL_AUTH_HEADER: &str = "x-fiducia-internal-auth";
+pub(crate) const INTERNAL_AUTH_HEADER: &str = "x-fiducia-internal-auth";
 
 /// The shared internal secret, read once. `None` (unset/blank) means the node
-/// guard is also off, so we send nothing.
-fn internal_secret() -> Option<&'static str> {
+/// and brain guards are also off, so we send nothing. Shared with `table.rs`
+/// (brain refresh) so the LB presents one consistent trusted-hop secret.
+pub(crate) fn internal_secret() -> Option<&'static str> {
     static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     SECRET
         .get_or_init(|| {
