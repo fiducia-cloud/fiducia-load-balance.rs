@@ -1279,6 +1279,80 @@ mod tests {
         assert_eq!(fake.mutation_count(), 1);
     }
 
+    #[test]
+    fn only_final_responses_are_cacheable_for_idempotent_replay() {
+        use StatusCode as S;
+        // Final responses are safe to store and replay.
+        for status in [S::OK, S::CREATED, S::BAD_REQUEST, S::NOT_FOUND, S::CONFLICT] {
+            assert!(is_cacheable_idempotent_response(status), "{status}");
+        }
+        // Transient responses must re-execute on retry, never be cached.
+        for status in [
+            S::INTERNAL_SERVER_ERROR,
+            S::BAD_GATEWAY,
+            S::SERVICE_UNAVAILABLE,
+            S::GATEWAY_TIMEOUT,
+            S::REQUEST_TIMEOUT,
+            S::TOO_MANY_REQUESTS,
+        ] {
+            assert!(!is_cacheable_idempotent_response(status), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn customer_idempotency_does_not_cache_transient_failures_and_retry_reexecutes() {
+        let (table, fake, server) = fake_cluster().await;
+        // The first upstream attempt fails transiently (503); the retry must re-run.
+        fake.queue_mutation_status(StatusCode::SERVICE_UNAVAILABLE);
+
+        let first = route(
+            table.clone(),
+            Some(test_identity("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F99".parse().unwrap(),
+            idempotency_headers("cust-key-transient"),
+            Bytes::from_static(br#"{"value":"paid"}"#),
+        )
+        .await;
+        let (status, headers, _body) = json_response(first).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers
+                .get(FIDUCIA_IDEMPOTENCY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("not_stored")
+        );
+        // The transient failure released the claim, so the key is re-claimable.
+        assert_eq!(fake.abandon_count(), 1);
+        assert_eq!(fake.mutation_count(), 1);
+
+        // Same key, same request: because the failure was not cached, this
+        // RE-EXECUTES the mutation rather than replaying the cached 503.
+        let second = route(
+            table,
+            Some(test_identity("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F99".parse().unwrap(),
+            idempotency_headers("cust-key-transient"),
+            Bytes::from_static(br#"{"value":"paid"}"#),
+        )
+        .await;
+        let (status, headers, body_json) = json_response(second).await;
+
+        server.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(FIDUCIA_IDEMPOTENCY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("stored")
+        );
+        // Re-executed, not replayed: the upstream saw the mutation a second time.
+        assert_eq!(fake.mutation_count(), 2);
+        assert_eq!(body_json["mutation_count"], 2);
+    }
+
     #[tokio::test]
     async fn customer_idempotency_rejects_same_key_with_different_fingerprint() {
         let (table, fake, server) = fake_cluster().await;
