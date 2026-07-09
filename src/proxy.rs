@@ -1385,6 +1385,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn require_idempotency_rejects_keyless_mutation_before_routing() {
+        // Enforcement happens before routing, so no upstream is needed.
+        let table = Arc::new(RouteTable::new(4, vec![]));
+        let response = route(
+            table,
+            Some(test_identity_requiring_idempotency("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F7".parse().unwrap(),
+            HeaderMap::new(), // no Idempotency-Key
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+        let (status, _headers, body_json) = json_response(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json["error"], "idempotency_key_required");
+    }
+
+    #[tokio::test]
+    async fn require_idempotency_does_not_gate_reads() {
+        let (table, _fake, server) = fake_cluster().await;
+        let response = route(
+            table,
+            Some(test_identity_requiring_idempotency("org_1")),
+            Method::GET,
+            "/v1/kv?key=orders%2F7".parse().unwrap(),
+            HeaderMap::new(), // no key, but a read is never gated
+            Bytes::new(),
+        )
+        .await;
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_idempotency_allows_mutation_carrying_a_key() {
+        let (table, fake, server) = fake_cluster().await;
+        let response = route(
+            table,
+            Some(test_identity_requiring_idempotency("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F7".parse().unwrap(),
+            idempotency_headers("cust-key-required"),
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+        let (status, headers, _body) = json_response(response).await;
+
+        server.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(FIDUCIA_IDEMPOTENCY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("stored")
+        );
+        assert_eq!(fake.mutation_count(), 1);
+    }
+
+    #[tokio::test]
     async fn customer_idempotency_rejects_same_key_with_different_fingerprint() {
         let (table, fake, server) = fake_cluster().await;
 
