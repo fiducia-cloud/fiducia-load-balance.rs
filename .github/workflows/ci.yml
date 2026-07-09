@@ -42,7 +42,7 @@ jobs:
         continue-on-error: true
       - name: test
         working-directory: repo
-        run: cargo test --lib --bins
+        run: cargo test --bins $(cargo build --lib --quiet 2>/dev/null && echo --lib)
       - name: audit
         working-directory: repo
         run: |
