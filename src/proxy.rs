@@ -853,6 +853,19 @@ fn bad_idempotency_key(reason: &'static str) -> Response {
         .into_response()
 }
 
+fn idempotency_key_required(method: &Method, uri: &Uri) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "idempotency_key_required",
+            "detail": "this API key requires an Idempotency-Key header on mutating requests",
+            "method": method.as_str(),
+            "path": uri.path(),
+        })),
+    )
+        .into_response()
+}
+
 fn idempotency_conflict(detail: &'static str) -> Response {
     (
         StatusCode::CONFLICT,
