@@ -1823,6 +1823,14 @@ mod tests {
             org_id: org_id.to_string(),
             key_id: Some("key_1".to_string()),
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            require_idempotency: false,
+        }
+    }
+
+    fn test_identity_requiring_idempotency(org_id: &str) -> VerifiedIdentity {
+        VerifiedIdentity {
+            require_idempotency: true,
+            ..test_identity(org_id)
         }
     }
 
