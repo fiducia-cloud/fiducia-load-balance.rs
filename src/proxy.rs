@@ -684,6 +684,39 @@ async fn complete_customer_idempotency(
     completed.then_some(()).ok_or("complete was rejected")
 }
 
+/// Release a still-claimed key after a transient upstream failure so the client's
+/// retry can re-execute the mutation immediately, rather than getting
+/// `409 in_progress` until the in-flight lease lapses. Best-effort: if the
+/// release itself fails, the short lease still frees the key on expiry.
+async fn abandon_customer_idempotency(
+    table: Arc<RouteTable>,
+    identity: Option<&VerifiedIdentity>,
+    idempotency: &CustomerIdempotency,
+    fencing_token: u64,
+) {
+    let body = json!({
+        "key": idempotency.internal_key,
+        "owner": idempotency.owner,
+        "fencing_token": fencing_token,
+    });
+    let response = route_without_customer_idempotency(
+        table,
+        identity.cloned(),
+        Method::POST,
+        "/v1/idempotency/abandon".parse().unwrap(),
+        json_headers(),
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+    )
+    .await;
+    match CapturedResponse::from_response(response).await {
+        Ok(captured) if captured.status.is_success() => {}
+        _ => tracing::warn!(
+            "failed to release customer idempotency claim after a non-final response; \
+             the in-flight lease will free it on expiry"
+        ),
+    }
+}
+
 fn response_for_duplicate_claim(
     idempotency: &CustomerIdempotency,
     claim: &IdempotencyClaim,
