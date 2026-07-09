@@ -34,9 +34,23 @@ const MAX_HOPS: usize = 4;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotent-replayed";
 const FIDUCIA_IDEMPOTENCY_HEADER: &str = "x-fiducia-idempotency";
+/// Retention for a *completed* customer idempotency record — how long a duplicate
+/// can still replay the stored response. `complete` extends the record's lease to
+/// this once the upstream response is captured.
 const CUSTOMER_IDEMPOTENCY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// In-flight lease for a *claimed-but-not-completed* request. Sized to a few times
+/// the ~5s upstream request timeout (× up to `MAX_HOPS`), so a crash between claim
+/// and complete frees the key in ~2min instead of poisoning it for the full 24h
+/// retention window. Comfortably larger than the worst-case upstream duration, so
+/// the lease never lapses mid-flight (which would risk a duplicate re-executing).
+const CUSTOMER_INFLIGHT_LEASE_MS: u64 = 120 * 1000;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 255;
 const MAX_REPLAY_BODY_BYTES: usize = 256 * 1024;
+/// Hard ceiling on how much of an upstream response the LB will buffer while
+/// making a request idempotent. Guards against a huge or malicious upstream body
+/// OOMing the proxy. Well above `MAX_REPLAY_BODY_BYTES` so ordinary responses pass
+/// through intact; a body larger than this cannot be made idempotent.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const PUBLIC_SCOPES: &[&str] = &[];
 const ADMIN_READ_SCOPES: &[&str] = &["admin:read", "admin:write"];
 const ADMIN_WRITE_SCOPES: &[&str] = &["admin:write"];
