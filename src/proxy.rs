@@ -668,7 +668,9 @@ async fn complete_customer_idempotency(
         Bytes::from(serde_json::to_vec(&body).map_err(|_| "could not encode complete body")?),
     )
     .await;
-    let captured = CapturedResponse::from_response(response).await;
+    let captured = CapturedResponse::from_response(response)
+        .await
+        .map_err(|_| "complete response was too large")?;
     if !captured.status.is_success() {
         return Err("complete request failed");
     }
