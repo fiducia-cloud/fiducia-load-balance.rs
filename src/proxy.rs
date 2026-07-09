@@ -620,7 +620,9 @@ async fn claim_customer_idempotency(
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
     )
     .await;
-    let captured = CapturedResponse::from_response(response).await;
+    let captured = CapturedResponse::from_response(response)
+        .await
+        .map_err(|_| idempotency_unavailable("claim response was too large"))?;
     if !captured.status.is_success() {
         return Err(idempotency_unavailable("claim request failed"));
     }
