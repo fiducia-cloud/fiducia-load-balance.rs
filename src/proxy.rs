@@ -590,7 +590,10 @@ async fn claim_customer_idempotency(
     let body = json!({
         "key": idempotency.internal_key,
         "owner": idempotency.owner,
-        "ttl_ms": CUSTOMER_IDEMPOTENCY_TTL_MS,
+        // Short in-flight lease so an abandoned claim frees the key quickly;
+        // `complete` extends the record to the full retention window.
+        "ttl_ms": CUSTOMER_INFLIGHT_LEASE_MS,
+        "retention_ms": CUSTOMER_IDEMPOTENCY_TTL_MS,
         "metadata": idempotency.metadata(),
     });
     let response = route_without_customer_idempotency(
