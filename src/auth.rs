@@ -481,6 +481,7 @@ fn identity_from_introspection(intro: Introspection) -> Option<VerifiedIdentity>
         org_id,
         key_id: intro.key_id,
         scopes: intro.scopes,
+        require_idempotency: intro.require_idempotency.unwrap_or(false),
     })
 }
 
