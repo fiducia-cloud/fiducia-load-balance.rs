@@ -162,6 +162,18 @@ pub async fn route(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    // Enforce the per-key policy (F1): a key configured `require_idempotency` may
+    // not make a mutating call without an `Idempotency-Key`. `from_request`
+    // yields `None` here only when the header is absent (a present-but-invalid key
+    // already returned `Err` above), and the method/route checks exclude reads and
+    // the idempotency primitives themselves.
+    if customer_idempotency.is_none()
+        && identity.as_ref().is_some_and(|id| id.require_idempotency)
+        && method_supports_customer_idempotency(&method)
+        && !is_idempotency_primitive(&uri)
+    {
+        return idempotency_key_required(&method, &uri);
+    }
     if let Some(idempotency) = customer_idempotency {
         return route_with_customer_idempotency(
             table,
