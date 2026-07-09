@@ -670,11 +670,13 @@ mod tests {
             org_id: Some("org_1".to_string()),
             key_id: Some("key_1".to_string()),
             scopes: vec!["kv:read".to_string()],
+            require_idempotency: Some(true),
         };
         let identity = identity_from_introspection(intro).unwrap();
         assert_eq!(identity.kind, AuthKind::ApiKey);
         assert_eq!(identity.org_id, "org_1");
         assert_eq!(identity.key_id.as_deref(), Some("key_1"));
         assert_eq!(identity.scopes_header(), "kv:read");
+        assert!(identity.require_idempotency);
     }
 }
