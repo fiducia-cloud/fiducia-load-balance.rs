@@ -1472,6 +1472,11 @@ mod tests {
     struct FakeNode {
         records: Mutex<HashMap<String, FakeRecord>>,
         mutations: Mutex<Vec<FakeMutation>>,
+        /// Status codes to return for successive mutations (FIFO). Empty → 200.
+        /// Lets a test script a transient failure followed by a success.
+        mutation_statuses: Mutex<std::collections::VecDeque<u16>>,
+        /// Keys released via `/v1/idempotency/abandon`.
+        abandons: Mutex<Vec<String>>,
     }
 
     #[derive(Clone)]
