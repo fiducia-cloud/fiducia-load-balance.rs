@@ -1543,17 +1543,48 @@ mod tests {
         match (method.as_str(), uri.path()) {
             ("POST", "/v1/idempotency/claim") => fake_claim(state, &headers, &body),
             ("POST", "/v1/idempotency/complete") => fake_complete(state, &headers, &body),
+            ("POST", "/v1/idempotency/abandon") => fake_abandon(state, &body),
             _ => {
                 let mut mutations = state.mutations.lock().unwrap();
                 mutations.push(FakeMutation { headers });
-                Json(json!({
-                    "ok": true,
-                    "method": method.as_str(),
-                    "target": uri.path_and_query().map(|value| value.as_str()).unwrap_or(uri.path()),
-                    "mutation_count": mutations.len(),
-                }))
-                .into_response()
+                let status = state
+                    .mutation_statuses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                    .unwrap_or(StatusCode::OK);
+                (
+                    status,
+                    Json(json!({
+                        "ok": status.is_success(),
+                        "method": method.as_str(),
+                        "target": uri.path_and_query().map(|value| value.as_str()).unwrap_or(uri.path()),
+                        "mutation_count": mutations.len(),
+                    })),
+                )
+                    .into_response()
             }
+        }
+    }
+
+    fn fake_abandon(state: Arc<FakeNode>, body: &[u8]) -> Response {
+        let value: Value = serde_json::from_slice(body).unwrap();
+        let key = value["key"].as_str().unwrap().to_string();
+        let token = value["fencing_token"].as_u64().unwrap();
+        let mut records = state.records.lock().unwrap();
+        match records.get(&key) {
+            Some(record) if record.fencing_token == token && record.status != "completed" => {
+                records.remove(&key);
+                state.abandons.lock().unwrap().push(key.clone());
+                committed_output(json!({ "abandoned": true, "key": key, "revision": 3 }))
+            }
+            Some(_) => committed_output(
+                json!({ "abandoned": false, "reason": "not_holder", "key": key, "revision": 3 }),
+            ),
+            None => committed_output(
+                json!({ "abandoned": false, "reason": "not_found", "key": key, "revision": 3 }),
+            ),
         }
     }
 
