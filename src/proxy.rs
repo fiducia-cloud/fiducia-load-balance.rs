@@ -1498,6 +1498,17 @@ mod tests {
             self.mutations.lock().unwrap().len()
         }
 
+        fn queue_mutation_status(&self, status: StatusCode) {
+            self.mutation_statuses
+                .lock()
+                .unwrap()
+                .push_back(status.as_u16());
+        }
+
+        fn abandon_count(&self) -> usize {
+            self.abandons.lock().unwrap().len()
+        }
+
         fn last_mutation_headers(&self) -> HeaderMap {
             self.mutations
                 .lock()
