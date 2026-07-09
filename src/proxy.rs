@@ -562,16 +562,31 @@ struct CapturedResponse {
 }
 
 impl CapturedResponse {
-    async fn from_response(response: Response) -> Self {
+    /// Buffer a response body up to [`MAX_CAPTURE_BYTES`]. Fails closed with a
+    /// `502` when the body exceeds the cap: buffering it in full would risk an
+    /// OOM, and previously the read-error path silently returned an *empty* body
+    /// to the client. Callers release the idempotency claim on error so a retry
+    /// can re-run.
+    async fn from_response(response: Response) -> Result<Self, Response> {
         let (parts, body) = response.into_parts();
-        let body = to_bytes(body, usize::MAX)
-            .await
-            .unwrap_or_else(|_| Bytes::new());
-        CapturedResponse {
+        let body = match to_bytes(body, MAX_CAPTURE_BYTES).await {
+            Ok(body) => body,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "upstream_response_too_large",
+                        "detail": "upstream response exceeded the proxy capture limit and cannot be made idempotent",
+                    })),
+                )
+                    .into_response());
+            }
+        };
+        Ok(CapturedResponse {
             status: parts.status,
             headers: parts.headers,
             body,
-        }
+        })
     }
 
     fn into_response(self) -> Response {
