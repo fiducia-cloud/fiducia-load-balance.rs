@@ -341,7 +341,33 @@ async fn route_with_customer_idempotency(
         body,
     )
     .await;
-    let captured = CapturedResponse::from_response(response).await;
+
+    // Bounded capture (F4): never buffer an unbounded upstream body. If the body
+    // is too large to buffer it also can't be replayed, so release the claim so a
+    // retry can re-run and surface a clear error instead of an empty response.
+    let captured = match CapturedResponse::from_response(response).await {
+        Ok(captured) => captured,
+        Err(response) => {
+            abandon_customer_idempotency(table, identity.as_ref(), &idempotency, fencing_token)
+                .await;
+            return response;
+        }
+    };
+
+    // Cache only *final* responses (F3). A transient failure (5xx / 408 / 429)
+    // must not be stored, or the client's correct retry would just replay the
+    // cached failure for the whole retention window. Release the claim instead so
+    // the retry actually re-executes the mutation.
+    if !is_cacheable_idempotent_response(captured.status) {
+        abandon_customer_idempotency(table, identity.as_ref(), &idempotency, fencing_token).await;
+        let mut response = captured.into_response();
+        response.headers_mut().insert(
+            FIDUCIA_IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("not_stored"),
+        );
+        return response;
+    }
+
     let stored = StoredIdempotencyResponse::from_captured(&idempotency, &captured);
     let completed = complete_customer_idempotency(
         table,
@@ -369,6 +395,20 @@ async fn route_with_customer_idempotency(
         }
     }
     response
+}
+
+/// Whether an upstream response is "final" and safe to store for idempotent
+/// replay. Transient failures — any 5xx, plus `408 Request Timeout` and
+/// `429 Too Many Requests` — are excluded so the client's retry re-executes the
+/// mutation instead of replaying a stale failure for the retention window.
+fn is_cacheable_idempotent_response(status: StatusCode) -> bool {
+    if status.is_server_error() {
+        return false;
+    }
+    !matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 #[derive(Debug, Clone)]
