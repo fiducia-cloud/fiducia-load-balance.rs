@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          path: fiducia-interfaces
+      - uses: actions/checkout@v4
+        with:
+          repository: fiducia-cloud/fiducia-routing.rs
+          path: fiducia-routing.rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: repo
+      - name: fmt
+        working-directory: repo
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: clippy
+        working-directory: repo
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
+      - name: test
+        working-directory: repo
+        run: cargo test --bins $(cargo build --lib --quiet 2>/dev/null && echo --lib)
+      - name: audit
+        working-directory: repo
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
+        continue-on-error: true
