@@ -15,14 +15,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: repo
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
           path: fiducia-interfaces
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: fiducia-cloud/fiducia-routing.rs
           path: fiducia-routing.rs
