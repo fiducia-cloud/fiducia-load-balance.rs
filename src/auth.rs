@@ -495,6 +495,9 @@ fn identity_from_claims(claims: FiduciaClaims) -> Result<VerifiedIdentity, AuthE
         org_id,
         key_id: claims.key_id,
         scopes: claims.scopes,
+        // JWT claims don't carry the per-key idempotency requirement; the control
+        // is an API-key policy, so JWT-authed callers are never gated on it.
+        require_idempotency: false,
     })
 }
 
