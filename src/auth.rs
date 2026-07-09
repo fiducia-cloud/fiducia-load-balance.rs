@@ -49,6 +49,10 @@ pub struct VerifiedIdentity {
     pub org_id: String,
     pub key_id: Option<String>,
     pub scopes: Vec<String>,
+    /// When true, the LB rejects mutating calls from this identity that omit an
+    /// `Idempotency-Key`. Carried from key introspection; false for JWTs and for
+    /// keys minted before the field existed (the control is opt-in).
+    pub require_idempotency: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
