@@ -45,7 +45,13 @@ const CUSTOMER_IDEMPOTENCY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// the lease never lapses mid-flight (which would risk a duplicate re-executing).
 const CUSTOMER_INFLIGHT_LEASE_MS: u64 = 120 * 1000;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 255;
-const MAX_REPLAY_BODY_BYTES: usize = 256 * 1024;
+/// Cap on the response body stored for idempotent replay. Kept small because a
+/// completed record — body included — lives hex-encoded in the node's Raft state,
+/// and the node log is not yet compacted (see the storage epic), so every stored
+/// byte persists for the full retention window. Ordinary JSON mutation responses
+/// fit comfortably; a larger response is served through once but not cached, so a
+/// duplicate gets `409 idempotency_replay_unavailable` rather than a stale replay.
+const MAX_REPLAY_BODY_BYTES: usize = 32 * 1024;
 /// Hard ceiling on how much of an upstream response the LB will buffer while
 /// making a request idempotent. Guards against a huge or malicious upstream body
 /// OOMing the proxy. Well above `MAX_REPLAY_BODY_BYTES` so ordinary responses pass
