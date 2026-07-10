@@ -49,6 +49,10 @@ pub struct VerifiedIdentity {
     pub org_id: String,
     pub key_id: Option<String>,
     pub scopes: Vec<String>,
+    /// When true, the LB rejects mutating calls from this identity that omit an
+    /// `Idempotency-Key`. Carried from key introspection; false for JWTs and for
+    /// keys minted before the field existed (the control is opt-in).
+    pub require_idempotency: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,6 +481,7 @@ fn identity_from_introspection(intro: Introspection) -> Option<VerifiedIdentity>
         org_id,
         key_id: intro.key_id,
         scopes: intro.scopes,
+        require_idempotency: intro.require_idempotency.unwrap_or(false),
     })
 }
 
@@ -490,6 +495,9 @@ fn identity_from_claims(claims: FiduciaClaims) -> Result<VerifiedIdentity, AuthE
         org_id,
         key_id: claims.key_id,
         scopes: claims.scopes,
+        // JWT claims don't carry the per-key idempotency requirement; the control
+        // is an API-key policy, so JWT-authed callers are never gated on it.
+        require_idempotency: false,
     })
 }
 
@@ -662,11 +670,13 @@ mod tests {
             org_id: Some("org_1".to_string()),
             key_id: Some("key_1".to_string()),
             scopes: vec!["kv:read".to_string()],
+            require_idempotency: Some(true),
         };
         let identity = identity_from_introspection(intro).unwrap();
         assert_eq!(identity.kind, AuthKind::ApiKey);
         assert_eq!(identity.org_id, "org_1");
         assert_eq!(identity.key_id.as_deref(), Some("key_1"));
         assert_eq!(identity.scopes_header(), "kv:read");
+        assert!(identity.require_idempotency);
     }
 }
