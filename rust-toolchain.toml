@@ -1,3 +1,4 @@
+# Pins the Rust toolchain (stable + rustfmt/clippy) used to build the load balancer.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
