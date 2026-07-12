@@ -200,12 +200,18 @@ async fn proxy_fallback(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match state.auth.authenticate(&headers).await {
-        Ok(identity) => {
-            proxy::route(state.routes.clone(), identity, method, uri, headers, body).await
-        }
-        Err(response) => response,
-    }
+    let identity = match state.auth.authenticate(&headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    // An edge-forwarded request carries no raw client credential (the edge strips
+    // it) and instead presents the already-verified identity in `x-fiducia-*`
+    // headers. Trust that identity only when the request also carries the shared
+    // internal secret proving the hop came from the edge; otherwise the request is
+    // treated as anonymous and its spoofable identity headers are dropped.
+    let identity = identity
+        .or_else(|| auth::trusted_edge_identity(&headers, proxy::internal_secret()));
+    proxy::route(state.routes.clone(), identity, method, uri, headers, body).await
 }
 
 /// `GET /_lb/routes` — dump the current shard→leader cache.
