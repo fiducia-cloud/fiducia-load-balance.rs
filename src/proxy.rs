@@ -200,11 +200,20 @@ fn authorize_route(
     uri: &Uri,
 ) -> Result<(), ScopeFailure> {
     let required = required_scopes_for_route(method, uri);
-    if required.is_empty() || identity.is_none() {
+    // Public / read-safe routes (no required scopes, e.g. healthz) stay open to
+    // anonymous callers.
+    if required.is_empty() {
         return Ok(());
     }
 
-    let identity = identity.expect("checked is_some");
+    // A scoped route with no verified identity fails CLOSED — regardless of
+    // `FIDUCIA_AUTH_REQUIRED`. This closes the bypass where an edge-forwarded (or
+    // otherwise credential-less) request would reach a mutating/admin route with
+    // `identity = None` and previously be blanket-allowed, then forwarded to the
+    // node under the LB's trusted internal secret.
+    let Some(identity) = identity else {
+        return Err(ScopeFailure { required });
+    };
     if has_any_scope(identity, required) {
         return Ok(());
     }
