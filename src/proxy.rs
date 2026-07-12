@@ -34,9 +34,29 @@ const MAX_HOPS: usize = 4;
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotent-replayed";
 const FIDUCIA_IDEMPOTENCY_HEADER: &str = "x-fiducia-idempotency";
+/// Retention for a *completed* customer idempotency record — how long a duplicate
+/// can still replay the stored response. `complete` extends the record's lease to
+/// this once the upstream response is captured.
 const CUSTOMER_IDEMPOTENCY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// In-flight lease for a *claimed-but-not-completed* request. Sized to a few times
+/// the ~5s upstream request timeout (× up to `MAX_HOPS`), so a crash between claim
+/// and complete frees the key in ~2min instead of poisoning it for the full 24h
+/// retention window. Comfortably larger than the worst-case upstream duration, so
+/// the lease never lapses mid-flight (which would risk a duplicate re-executing).
+const CUSTOMER_INFLIGHT_LEASE_MS: u64 = 120 * 1000;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 255;
-const MAX_REPLAY_BODY_BYTES: usize = 256 * 1024;
+/// Cap on the response body stored for idempotent replay. Kept small because a
+/// completed record — body included — lives hex-encoded in the node's Raft state,
+/// and the node log is not yet compacted (see the storage epic), so every stored
+/// byte persists for the full retention window. Ordinary JSON mutation responses
+/// fit comfortably; a larger response is served through once but not cached, so a
+/// duplicate gets `409 idempotency_replay_unavailable` rather than a stale replay.
+const MAX_REPLAY_BODY_BYTES: usize = 32 * 1024;
+/// Hard ceiling on how much of an upstream response the LB will buffer while
+/// making a request idempotent. Guards against a huge or malicious upstream body
+/// OOMing the proxy. Well above `MAX_REPLAY_BODY_BYTES` so ordinary responses pass
+/// through intact; a body larger than this cannot be made idempotent.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const PUBLIC_SCOPES: &[&str] = &[];
 const ADMIN_READ_SCOPES: &[&str] = &["admin:read", "admin:write"];
 const ADMIN_WRITE_SCOPES: &[&str] = &["admin:write"];
@@ -142,6 +162,18 @@ pub async fn route(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    // Enforce the per-key policy (F1): a key configured `require_idempotency` may
+    // not make a mutating call without an `Idempotency-Key`. `from_request`
+    // yields `None` here only when the header is absent (a present-but-invalid key
+    // already returned `Err` above), and the method/route checks exclude reads and
+    // the idempotency primitives themselves.
+    if customer_idempotency.is_none()
+        && identity.as_ref().is_some_and(|id| id.require_idempotency)
+        && method_supports_customer_idempotency(&method)
+        && !is_idempotency_primitive(&uri)
+    {
+        return idempotency_key_required(&method, &uri);
+    }
     if let Some(idempotency) = customer_idempotency {
         return route_with_customer_idempotency(
             table,
@@ -327,7 +359,33 @@ async fn route_with_customer_idempotency(
         body,
     )
     .await;
-    let captured = CapturedResponse::from_response(response).await;
+
+    // Bounded capture (F4): never buffer an unbounded upstream body. If the body
+    // is too large to buffer it also can't be replayed, so release the claim so a
+    // retry can re-run and surface a clear error instead of an empty response.
+    let captured = match CapturedResponse::from_response(response).await {
+        Ok(captured) => captured,
+        Err(response) => {
+            abandon_customer_idempotency(table, identity.as_ref(), &idempotency, fencing_token)
+                .await;
+            return response;
+        }
+    };
+
+    // Cache only *final* responses (F3). A transient failure (5xx / 408 / 429)
+    // must not be stored, or the client's correct retry would just replay the
+    // cached failure for the whole retention window. Release the claim instead so
+    // the retry actually re-executes the mutation.
+    if !is_cacheable_idempotent_response(captured.status) {
+        abandon_customer_idempotency(table, identity.as_ref(), &idempotency, fencing_token).await;
+        let mut response = captured.into_response();
+        response.headers_mut().insert(
+            FIDUCIA_IDEMPOTENCY_HEADER,
+            HeaderValue::from_static("not_stored"),
+        );
+        return response;
+    }
+
     let stored = StoredIdempotencyResponse::from_captured(&idempotency, &captured);
     let completed = complete_customer_idempotency(
         table,
@@ -355,6 +413,20 @@ async fn route_with_customer_idempotency(
         }
     }
     response
+}
+
+/// Whether an upstream response is "final" and safe to store for idempotent
+/// replay. Transient failures — any 5xx, plus `408 Request Timeout` and
+/// `429 Too Many Requests` — are excluded so the client's retry re-executes the
+/// mutation instead of replaying a stale failure for the retention window.
+fn is_cacheable_idempotent_response(status: StatusCode) -> bool {
+    if status.is_server_error() {
+        return false;
+    }
+    !matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -508,16 +580,31 @@ struct CapturedResponse {
 }
 
 impl CapturedResponse {
-    async fn from_response(response: Response) -> Self {
+    /// Buffer a response body up to [`MAX_CAPTURE_BYTES`]. Fails closed with a
+    /// `502` when the body exceeds the cap: buffering it in full would risk an
+    /// OOM, and previously the read-error path silently returned an *empty* body
+    /// to the client. Callers release the idempotency claim on error so a retry
+    /// can re-run.
+    async fn from_response(response: Response) -> Result<Self, Response> {
         let (parts, body) = response.into_parts();
-        let body = to_bytes(body, usize::MAX)
-            .await
-            .unwrap_or_else(|_| Bytes::new());
-        CapturedResponse {
+        let body = match to_bytes(body, MAX_CAPTURE_BYTES).await {
+            Ok(body) => body,
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "upstream_response_too_large",
+                        "detail": "upstream response exceeded the proxy capture limit and cannot be made idempotent",
+                    })),
+                )
+                    .into_response());
+            }
+        };
+        Ok(CapturedResponse {
             status: parts.status,
             headers: parts.headers,
             body,
-        }
+        })
     }
 
     fn into_response(self) -> Response {
@@ -536,7 +623,10 @@ async fn claim_customer_idempotency(
     let body = json!({
         "key": idempotency.internal_key,
         "owner": idempotency.owner,
-        "ttl_ms": CUSTOMER_IDEMPOTENCY_TTL_MS,
+        // Short in-flight lease so an abandoned claim frees the key quickly;
+        // `complete` extends the record to the full retention window.
+        "ttl_ms": CUSTOMER_INFLIGHT_LEASE_MS,
+        "retention_ms": CUSTOMER_IDEMPOTENCY_TTL_MS,
         "metadata": idempotency.metadata(),
     });
     let response = route_without_customer_idempotency(
@@ -548,7 +638,9 @@ async fn claim_customer_idempotency(
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
     )
     .await;
-    let captured = CapturedResponse::from_response(response).await;
+    let captured = CapturedResponse::from_response(response)
+        .await
+        .map_err(|_| idempotency_unavailable("claim response was too large"))?;
     if !captured.status.is_success() {
         return Err(idempotency_unavailable("claim request failed"));
     }
@@ -594,7 +686,9 @@ async fn complete_customer_idempotency(
         Bytes::from(serde_json::to_vec(&body).map_err(|_| "could not encode complete body")?),
     )
     .await;
-    let captured = CapturedResponse::from_response(response).await;
+    let captured = CapturedResponse::from_response(response)
+        .await
+        .map_err(|_| "complete response was too large")?;
     if !captured.status.is_success() {
         return Err("complete request failed");
     }
@@ -606,6 +700,39 @@ async fn complete_customer_idempotency(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     completed.then_some(()).ok_or("complete was rejected")
+}
+
+/// Release a still-claimed key after a transient upstream failure so the client's
+/// retry can re-execute the mutation immediately, rather than getting
+/// `409 in_progress` until the in-flight lease lapses. Best-effort: if the
+/// release itself fails, the short lease still frees the key on expiry.
+async fn abandon_customer_idempotency(
+    table: Arc<RouteTable>,
+    identity: Option<&VerifiedIdentity>,
+    idempotency: &CustomerIdempotency,
+    fencing_token: u64,
+) {
+    let body = json!({
+        "key": idempotency.internal_key,
+        "owner": idempotency.owner,
+        "fencing_token": fencing_token,
+    });
+    let response = route_without_customer_idempotency(
+        table,
+        identity.cloned(),
+        Method::POST,
+        "/v1/idempotency/abandon".parse().unwrap(),
+        json_headers(),
+        Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
+    )
+    .await;
+    match CapturedResponse::from_response(response).await {
+        Ok(captured) if captured.status.is_success() => {}
+        _ => tracing::warn!(
+            "failed to release customer idempotency claim after a non-final response; \
+             the in-flight lease will free it on expiry"
+        ),
+    }
 }
 
 fn response_for_duplicate_claim(
@@ -721,6 +848,19 @@ fn bad_idempotency_key(reason: &'static str) -> Response {
         Json(json!({
             "error": "bad_idempotency_key",
             "detail": reason,
+        })),
+    )
+        .into_response()
+}
+
+fn idempotency_key_required(method: &Method, uri: &Uri) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "idempotency_key_required",
+            "detail": "this API key requires an Idempotency-Key header on mutating requests",
+            "method": method.as_str(),
+            "path": uri.path(),
         })),
     )
         .into_response()
@@ -1170,6 +1310,139 @@ mod tests {
         assert_eq!(fake.mutation_count(), 1);
     }
 
+    #[test]
+    fn only_final_responses_are_cacheable_for_idempotent_replay() {
+        use StatusCode as S;
+        // Final responses are safe to store and replay.
+        for status in [S::OK, S::CREATED, S::BAD_REQUEST, S::NOT_FOUND, S::CONFLICT] {
+            assert!(is_cacheable_idempotent_response(status), "{status}");
+        }
+        // Transient responses must re-execute on retry, never be cached.
+        for status in [
+            S::INTERNAL_SERVER_ERROR,
+            S::BAD_GATEWAY,
+            S::SERVICE_UNAVAILABLE,
+            S::GATEWAY_TIMEOUT,
+            S::REQUEST_TIMEOUT,
+            S::TOO_MANY_REQUESTS,
+        ] {
+            assert!(!is_cacheable_idempotent_response(status), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn customer_idempotency_does_not_cache_transient_failures_and_retry_reexecutes() {
+        let (table, fake, server) = fake_cluster().await;
+        // The first upstream attempt fails transiently (503); the retry must re-run.
+        fake.queue_mutation_status(StatusCode::SERVICE_UNAVAILABLE);
+
+        let first = route(
+            table.clone(),
+            Some(test_identity("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F99".parse().unwrap(),
+            idempotency_headers("cust-key-transient"),
+            Bytes::from_static(br#"{"value":"paid"}"#),
+        )
+        .await;
+        let (status, headers, _body) = json_response(first).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            headers
+                .get(FIDUCIA_IDEMPOTENCY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("not_stored")
+        );
+        // The transient failure released the claim, so the key is re-claimable.
+        assert_eq!(fake.abandon_count(), 1);
+        assert_eq!(fake.mutation_count(), 1);
+
+        // Same key, same request: because the failure was not cached, this
+        // RE-EXECUTES the mutation rather than replaying the cached 503.
+        let second = route(
+            table,
+            Some(test_identity("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F99".parse().unwrap(),
+            idempotency_headers("cust-key-transient"),
+            Bytes::from_static(br#"{"value":"paid"}"#),
+        )
+        .await;
+        let (status, headers, body_json) = json_response(second).await;
+
+        server.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(FIDUCIA_IDEMPOTENCY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("stored")
+        );
+        // Re-executed, not replayed: the upstream saw the mutation a second time.
+        assert_eq!(fake.mutation_count(), 2);
+        assert_eq!(body_json["mutation_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn require_idempotency_rejects_keyless_mutation_before_routing() {
+        // Enforcement happens before routing, so no upstream is needed.
+        let table = Arc::new(RouteTable::new(4, vec![]));
+        let response = route(
+            table,
+            Some(test_identity_requiring_idempotency("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F7".parse().unwrap(),
+            HeaderMap::new(), // no Idempotency-Key
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+        let (status, _headers, body_json) = json_response(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body_json["error"], "idempotency_key_required");
+    }
+
+    #[tokio::test]
+    async fn require_idempotency_does_not_gate_reads() {
+        let (table, _fake, server) = fake_cluster().await;
+        let response = route(
+            table,
+            Some(test_identity_requiring_idempotency("org_1")),
+            Method::GET,
+            "/v1/kv?key=orders%2F7".parse().unwrap(),
+            HeaderMap::new(), // no key, but a read is never gated
+            Bytes::new(),
+        )
+        .await;
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_idempotency_allows_mutation_carrying_a_key() {
+        let (table, fake, server) = fake_cluster().await;
+        let response = route(
+            table,
+            Some(test_identity_requiring_idempotency("org_1")),
+            Method::PUT,
+            "/v1/kv?key=orders%2F7".parse().unwrap(),
+            idempotency_headers("cust-key-required"),
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+        let (status, headers, _body) = json_response(response).await;
+
+        server.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(FIDUCIA_IDEMPOTENCY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("stored")
+        );
+        assert_eq!(fake.mutation_count(), 1);
+    }
+
     #[tokio::test]
     async fn customer_idempotency_rejects_same_key_with_different_fingerprint() {
         let (table, fake, server) = fake_cluster().await;
@@ -1363,6 +1636,11 @@ mod tests {
     struct FakeNode {
         records: Mutex<HashMap<String, FakeRecord>>,
         mutations: Mutex<Vec<FakeMutation>>,
+        /// Status codes to return for successive mutations (FIFO). Empty → 200.
+        /// Lets a test script a transient failure followed by a success.
+        mutation_statuses: Mutex<std::collections::VecDeque<u16>>,
+        /// Keys released via `/v1/idempotency/abandon`.
+        abandons: Mutex<Vec<String>>,
     }
 
     #[derive(Clone)]
@@ -1382,6 +1660,17 @@ mod tests {
     impl FakeNode {
         fn mutation_count(&self) -> usize {
             self.mutations.lock().unwrap().len()
+        }
+
+        fn queue_mutation_status(&self, status: StatusCode) {
+            self.mutation_statuses
+                .lock()
+                .unwrap()
+                .push_back(status.as_u16());
+        }
+
+        fn abandon_count(&self) -> usize {
+            self.abandons.lock().unwrap().len()
         }
 
         fn last_mutation_headers(&self) -> HeaderMap {
@@ -1418,17 +1707,48 @@ mod tests {
         match (method.as_str(), uri.path()) {
             ("POST", "/v1/idempotency/claim") => fake_claim(state, &headers, &body),
             ("POST", "/v1/idempotency/complete") => fake_complete(state, &headers, &body),
+            ("POST", "/v1/idempotency/abandon") => fake_abandon(state, &body),
             _ => {
                 let mut mutations = state.mutations.lock().unwrap();
                 mutations.push(FakeMutation { headers });
-                Json(json!({
-                    "ok": true,
-                    "method": method.as_str(),
-                    "target": uri.path_and_query().map(|value| value.as_str()).unwrap_or(uri.path()),
-                    "mutation_count": mutations.len(),
-                }))
-                .into_response()
+                let status = state
+                    .mutation_statuses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                    .unwrap_or(StatusCode::OK);
+                (
+                    status,
+                    Json(json!({
+                        "ok": status.is_success(),
+                        "method": method.as_str(),
+                        "target": uri.path_and_query().map(|value| value.as_str()).unwrap_or(uri.path()),
+                        "mutation_count": mutations.len(),
+                    })),
+                )
+                    .into_response()
             }
+        }
+    }
+
+    fn fake_abandon(state: Arc<FakeNode>, body: &[u8]) -> Response {
+        let value: Value = serde_json::from_slice(body).unwrap();
+        let key = value["key"].as_str().unwrap().to_string();
+        let token = value["fencing_token"].as_u64().unwrap();
+        let mut records = state.records.lock().unwrap();
+        match records.get(&key) {
+            Some(record) if record.fencing_token == token && record.status != "completed" => {
+                records.remove(&key);
+                state.abandons.lock().unwrap().push(key.clone());
+                committed_output(json!({ "abandoned": true, "key": key, "revision": 3 }))
+            }
+            Some(_) => committed_output(
+                json!({ "abandoned": false, "reason": "not_holder", "key": key, "revision": 3 }),
+            ),
+            None => committed_output(
+                json!({ "abandoned": false, "reason": "not_found", "key": key, "revision": 3 }),
+            ),
         }
     }
 
@@ -1562,6 +1882,14 @@ mod tests {
             org_id: org_id.to_string(),
             key_id: Some("key_1".to_string()),
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            require_idempotency: false,
+        }
+    }
+
+    fn test_identity_requiring_idempotency(org_id: &str) -> VerifiedIdentity {
+        VerifiedIdentity {
+            require_idempotency: true,
+            ..test_identity(org_id)
         }
     }
 
