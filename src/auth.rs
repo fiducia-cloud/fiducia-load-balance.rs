@@ -329,10 +329,84 @@ pub fn should_strip_client_auth_header(name: &str) -> bool {
             | "x-fiducia-org-id"
             | "x-fiducia-key-id"
             | "x-fiducia-scopes"
+            // The edge→LB trusted-hop proof. The LB consumes it inbound (to decide
+            // whether to trust the forwarded `x-fiducia-*` identity) and must never
+            // forward it to the node, nor let a direct client inject it.
+            | EDGE_AUTH_HEADER
             // The trusted-hop secret to the node: only the LB may set it, never a
             // client. The LB re-attaches its own in `proxy::forward_once`.
             | "x-fiducia-internal-auth"
     )
+}
+
+/// Header the edge presents to prove an inbound request is a trusted edge hop.
+/// Its value is the shared cluster secret (`FIDUCIA_INTERNAL_SECRET`); a direct
+/// client cannot forge it, and `should_strip_client_auth_header` guarantees the
+/// LB never forwards a client-supplied copy of it downstream.
+pub const EDGE_AUTH_HEADER: &str = "x-fiducia-edge-auth";
+
+/// Identity forwarded by a trusted edge hop.
+///
+/// The edge authenticates the caller, strips the raw client credential, and
+/// forwards the verified identity in `x-fiducia-*` headers plus the shared secret
+/// in [`EDGE_AUTH_HEADER`]. The LB trusts that identity **only** when the secret
+/// is present and constant-time-equal to `expected_secret`. Without a valid
+/// secret this returns `None`, so the request is treated as anonymous (and the
+/// spoofable `x-fiducia-*` headers are stripped before forwarding), closing the
+/// bypass where an edge-forwarded request would otherwise arrive with no identity
+/// and skip the LB's per-route scope checks.
+pub fn trusted_edge_identity(
+    headers: &HeaderMap,
+    expected_secret: Option<&str>,
+) -> Option<VerifiedIdentity> {
+    let expected = expected_secret?;
+    let provided = header_str(headers, EDGE_AUTH_HEADER)?;
+    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return None;
+    }
+
+    let org_id = header_str(headers, "x-fiducia-org-id")?.trim().to_string();
+    if org_id.is_empty() {
+        return None;
+    }
+    let kind = match header_str(headers, "x-fiducia-auth-kind") {
+        Some("jwt") => AuthKind::Jwt,
+        _ => AuthKind::ApiKey,
+    };
+    let scopes = header_str(headers, "x-fiducia-scopes")
+        .map(|value| value.split_whitespace().map(ToOwned::to_owned).collect())
+        .unwrap_or_default();
+    let key_id = header_str(headers, "x-fiducia-key-id")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    Some(VerifiedIdentity {
+        kind,
+        org_id,
+        key_id,
+        scopes,
+        // The per-key idempotency policy is not carried across the edge hop; it is
+        // enforced when the LB authenticates a raw credential directly.
+        require_idempotency: false,
+    })
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Length-then-content compare that doesn't short-circuit on the first differing
+/// byte, so the shared secret can't be recovered a byte at a time via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Debug, Clone)]
