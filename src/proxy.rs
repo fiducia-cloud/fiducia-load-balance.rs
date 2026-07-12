@@ -1567,11 +1567,14 @@ mod tests {
     #[tokio::test]
     async fn customer_idempotency_rejects_blank_or_oversized_keys_before_routing() {
         let table = Arc::new(RouteTable::new(4, vec![]));
+        // A scoped write is now rejected for an anonymous caller before key
+        // validation, so use an authorized identity to reach that validation.
+        let locks_writer = test_identity_with_scopes("org_1", &["locks:write"]);
         let mut blank = HeaderMap::new();
         blank.insert(IDEMPOTENCY_KEY_HEADER, "   ".parse().unwrap());
         let response = route(
             table.clone(),
-            None,
+            Some(locks_writer.clone()),
             Method::POST,
             "/v1/locks/acquire".parse().unwrap(),
             blank,
@@ -1587,7 +1590,7 @@ mod tests {
         long.insert(IDEMPOTENCY_KEY_HEADER, key.parse().unwrap());
         let response = route(
             table.clone(),
-            None,
+            Some(locks_writer.clone()),
             Method::POST,
             "/v1/locks/acquire".parse().unwrap(),
             long,
@@ -1603,7 +1606,7 @@ mod tests {
         );
         let response = route(
             table,
-            None,
+            Some(locks_writer),
             Method::POST,
             "/v1/locks/acquire".parse().unwrap(),
             non_text,
