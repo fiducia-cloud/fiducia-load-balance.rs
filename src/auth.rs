@@ -729,12 +729,44 @@ mod tests {
             "x-fiducia-org-id",
             "x-fiducia-key-id",
             "x-fiducia-scopes",
+            "x-fiducia-edge-auth",
+            "X-Fiducia-Edge-Auth",
             "x-fiducia-internal-auth",
             "X-Fiducia-Internal-Auth",
         ] {
             assert!(should_strip_client_auth_header(name));
         }
         assert!(!should_strip_client_auth_header("x-fiducia-edge-region"));
+    }
+
+    #[test]
+    fn trusted_edge_identity_requires_the_shared_secret() {
+        let mut headers = HeaderMap::new();
+        headers.insert(EDGE_AUTH_HEADER, "edge-secret".parse().unwrap());
+        headers.insert("x-fiducia-auth-kind", "api_key".parse().unwrap());
+        headers.insert("x-fiducia-org-id", "org_9".parse().unwrap());
+        headers.insert("x-fiducia-scopes", "kv:read kv:write".parse().unwrap());
+        headers.insert("x-fiducia-key-id", "key_9".parse().unwrap());
+
+        // Valid secret → the forwarded identity is trusted.
+        let identity = trusted_edge_identity(&headers, Some("edge-secret")).unwrap();
+        assert_eq!(identity.kind, AuthKind::ApiKey);
+        assert_eq!(identity.org_id, "org_9");
+        assert_eq!(identity.key_id.as_deref(), Some("key_9"));
+        assert_eq!(identity.scopes, vec!["kv:read", "kv:write"]);
+
+        // Wrong secret, absent secret, or no secret configured → not trusted.
+        assert!(trusted_edge_identity(&headers, Some("wrong-secret")).is_none());
+        assert!(trusted_edge_identity(&headers, None).is_none());
+    }
+
+    #[test]
+    fn trusted_edge_identity_rejects_spoofed_headers_without_the_secret() {
+        // A direct client injects identity headers but cannot supply the secret.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fiducia-org-id", "org_evil".parse().unwrap());
+        headers.insert("x-fiducia-scopes", "admin:write".parse().unwrap());
+        assert!(trusted_edge_identity(&headers, Some("edge-secret")).is_none());
     }
 
     #[test]
