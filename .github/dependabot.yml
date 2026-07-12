@@ -1,3 +1,4 @@
+# Dependabot config: weekly update PRs for Cargo crates and GitHub Actions.
 version: 2
 updates:
   - package-ecosystem: cargo

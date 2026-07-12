@@ -1,3 +1,4 @@
+# CI: builds, lints, and tests the load balancer on push/PR.
 name: ci
 
 on:

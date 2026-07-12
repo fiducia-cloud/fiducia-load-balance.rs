@@ -1,3 +1,4 @@
+# Cargo manifest for fiducia-load-balance: the edge, key-aware LB binary.
 [package]
 name = "fiducia-load-balance"
 version = "0.1.0"

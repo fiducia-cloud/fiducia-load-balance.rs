@@ -1,3 +1,4 @@
+# Builds and publishes the load balancer's container image on pushes to main.
 name: docker
 on:
   push:
