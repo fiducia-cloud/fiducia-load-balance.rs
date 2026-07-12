@@ -361,6 +361,7 @@ mod interface_contract_tests {
             org_id: "org_test".to_string(),
             key_id: Some("key_test".to_string()),
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            require_idempotency: false,
         }
     }
 }
