@@ -472,6 +472,63 @@ mod interface_contract_tests {
         assert!(authorize_admin_read(Some(&test_identity(&["*"]))).is_ok());
     }
 
+    #[test]
+    fn plaintext_upgrade_redirects_to_https_preserving_host_and_path() {
+        // Default HTTPS port (443): authority carries no explicit port.
+        assert_eq!(
+            upgrade_location(Some("api.fiducia.cloud"), 443, "/v1/kv/foo?bar=1").as_deref(),
+            Some("https://api.fiducia.cloud/v1/kv/foo?bar=1"),
+        );
+        // Non-standard TLS_PORT is appended (in-cluster ClusterIP case).
+        assert_eq!(
+            upgrade_location(
+                Some("fiducia-load-balance-internal.fiducia.svc.cluster.local:8088"),
+                8443,
+                "/v1/locks/checkout",
+            )
+            .as_deref(),
+            Some("https://fiducia-load-balance-internal.fiducia.svc.cluster.local:8443/v1/locks/checkout"),
+        );
+        // IPv6 literal host keeps its brackets.
+        assert_eq!(
+            upgrade_location(Some("[::1]:8088"), 8443, "/healthz").as_deref(),
+            Some("https://[::1]:8443/healthz"),
+        );
+        // No / empty Host ⇒ no redirect target ⇒ caller returns 426.
+        assert_eq!(upgrade_location(None, 8443, "/v1/kv/foo"), None);
+        assert_eq!(upgrade_location(Some("   "), 8443, "/v1/kv/foo"), None);
+    }
+
+    #[test]
+    fn plaintext_guard_serves_probes_but_upgrades_everything_else() {
+        // 308 is method/body preserving so a plaintext mutation is re-sent, not
+        // downgraded to GET.
+        let resp = upgrade_to_https(
+            8443,
+            "/v1/kv/foo?x=1".parse().unwrap(),
+            host_headers("lb.internal:8088"),
+        );
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "https://lb.internal:8443/v1/kv/foo?x=1",
+        );
+
+        // Missing Host ⇒ 426 Upgrade Required (still no cleartext proxying).
+        let resp = upgrade_to_https(8443, "/v1/kv/foo".parse().unwrap(), HeaderMap::new());
+        assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+
+        // The guard router only registers the two probe routes as real handlers;
+        // building it must not panic.
+        let _ = build_plaintext_guard_app(8443);
+    }
+
+    fn host_headers(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers
+    }
+
     fn test_identity(scopes: &[&str]) -> auth::VerifiedIdentity {
         auth::VerifiedIdentity {
             kind: auth::AuthKind::ApiKey,
