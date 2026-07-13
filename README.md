@@ -277,4 +277,4 @@ Accepted / known advisories (`cargo audit` is otherwise clean):
 
 - [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (sharded coordination engine).
 - [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane (placement, scaling, failure handling).
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website webserver.
+- [`fiducia-customer.rs`](https://github.com/fiducia-cloud/fiducia-customer.rs) — the website webserver.
