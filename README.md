@@ -70,10 +70,12 @@ customer header is consumed at the LB and is not forwarded to nodes.
 
 TLS termination can happen at this LB: set `FIDUCIA_TLS_CERT_PATH` and
 `FIDUCIA_TLS_KEY_PATH` and it will listen on `TLS_PORT` (default `8443`) with
-Rustls while continuing to serve plain HTTP on `PORT` for in-cluster health
-checks or private callers. If Cloudflare is later enabled in front of it, use
-Cloudflare in "Full (strict)" mode and point the origin at the LB HTTPS port; do
-not route Cloudflare directly to node pods.
+Rustls. When TLS is on, the plaintext `PORT` listener stays bound for k8s probes
+but **stops proxying application traffic in cleartext**: it answers `/healthz` and
+`/readyz`, and `308`-redirects every other path to the HTTPS endpoint (`426
+Upgrade Required` when there is no `Host` to redirect to). If Cloudflare is later
+enabled in front of it, use Cloudflare in "Full (strict)" mode and point the
+origin at the LB HTTPS port; do not route Cloudflare directly to node pods.
 
 ## Two planes, two transports
 
