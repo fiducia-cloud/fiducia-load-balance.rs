@@ -19,11 +19,13 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
 
 - **Fast path** — cache says who leads the shard; forward straight there.
 - **Backstop** — if the cache is wrong and the request lands on a follower, the
-  node replies `NotLeader` (HTTP `307` + leader hint); the LB follows it and
-  updates the cache. Self-healing, the way etcd/TiKV clients work.
-- **No-hint fallback** — if the follower does not know the leader yet, the LB
-  round-robins another known node until a leader responds or the retry budget is
-  exhausted.
+  node replies `NotLeader` (HTTP `307` + leader hint); the LB follows it only
+  when the target is present in brain's healthy membership, then updates the
+  cache. An arbitrary redirect can never receive the trusted-hop secret.
+- **No-hint fallback** — if a follower explicitly says `NotLeader` but cannot
+  name the leader, the LB may try another known node. Transport failures are
+  retried only for reads: a mutation with a lost response is ambiguous and is
+  returned as `502 ambiguous_upstream_result`, never replayed automatically.
 
 The cache is seeded/refreshed from the control plane (`fiducia-brain`'s
 `/v1/placement`). The LB holds **no consensus state** — it's just a cache — so
@@ -178,7 +180,15 @@ The LB authenticates at the boundary and **fails closed**:
   `x-api-key`, `cookie`, `x-fiducia-edge-auth`, and `x-fiducia-internal-auth` are
   never forwarded from a client to a node; the LB injects its own.
 - **Body limits.** Inbound bodies are capped at 1 MiB; idempotent-replay capture
-  is bounded (8 MiB capture ceiling, 32 KiB stored, 255-byte idempotency keys).
+  is bounded (8 MiB upstream/response ceiling, 32 KiB stored, 255-byte
+  idempotency keys).
+- **Failover does not duplicate writes.** Explicit `NotLeader` responses are safe
+  to retry against another known member because the node rejected the request.
+  Network errors/timeouts on mutations are not retried: the result may have
+  committed. Clients should retry with the same `Idempotency-Key`.
+- **Leader hints are membership-bound.** Redirect targets must match the healthy
+  node set learned from configuration/brain before the LB updates its cache or
+  forwards the internal shared secret.
 - **Panics are contained.** A `CatchPanicLayer` turns any handler panic into a
   `500` instead of dropping the connection.
 
