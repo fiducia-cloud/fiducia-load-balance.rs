@@ -163,11 +163,68 @@ mod tests {
     fn uri(s: &str) -> Uri {
         s.parse().unwrap()
     }
+    // Anonymous (org-less) forms: exercise the raw key extraction.
     fn key(s: &str) -> Option<String> {
-        routing_key(&uri(s))
+        routing_key(&uri(s), None)
     }
     fn key_with_body(s: &str, body: &[u8]) -> Option<String> {
-        routing_key_with_body(&uri(s), body)
+        routing_key_with_body(&uri(s), body, None)
+    }
+
+    /// The verified org scopes every org-owned routing key exactly like the
+    /// node's `OrgScope::scope`, so the LB hashes the same key the node commits
+    /// under. Before this, the LB hashed the RAW key and predicted the wrong
+    /// shard for essentially every org-scoped request (a NotLeader redirect
+    /// per first touch, forever).
+    #[test]
+    fn org_owned_keys_are_scoped_with_the_callers_org() {
+        let org = Some("org_1");
+        let scoped = |k: &str| fiducia_routing::org_scoped_key("org_1", k);
+        assert_eq!(
+            routing_key(&uri("/v1/kv?key=orders/checkout"), org).as_deref(),
+            Some(scoped("orders/checkout").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/idempotency?key=req-1"), org).as_deref(),
+            Some(scoped("req-1").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/rate-limit/acme/checkout/check"), org).as_deref(),
+            Some(scoped("checkout").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/cron/schedules/nightly/history"), org).as_deref(),
+            Some(scoped("nightly").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/elections/cleanup/campaign"), org).as_deref(),
+            Some(scoped("cleanup").as_str()),
+        );
+        assert_eq!(
+            routing_key_with_body(&uri("/v1/idempotency/claim"), br#"{"key":"req-9"}"#, org)
+                .as_deref(),
+            Some(scoped("req-9").as_str()),
+        );
+    }
+
+    /// Cluster-reserved coordinator keys are NOT org-owned: every org's lock
+    /// and discovery traffic must meet on the same shard, so the org never
+    /// touches them.
+    #[test]
+    fn coordinator_keys_are_never_org_scoped() {
+        let org = Some("org_1");
+        assert_eq!(
+            routing_key(&uri("/v1/locks/acquire"), org).as_deref(),
+            Some(LOCK_COORDINATION_KEY),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/semaphores/acquire"), org).as_deref(),
+            Some(LOCK_COORDINATION_KEY),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/services/api"), org).as_deref(),
+            Some(SERVICE_DISCOVERY_KEY),
+        );
     }
 
     #[test]
