@@ -29,7 +29,7 @@ use std::time::Duration;
 use axum::{
     body::Bytes,
     extract::{Query, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -110,7 +110,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8088);
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let http = serve_http(http_addr, app.clone());
 
     // Loud, explicit warning for the opt-in trust-boundary mode: with no shared
     // secret the LB will NOT trust edge-forwarded `x-fiducia-*` identities (they
@@ -126,10 +125,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if let Some(tls) = tls_settings()? {
-        // NOTE: the plaintext HTTP listener on PORT stays open alongside TLS_PORT
-        // (in-cluster health checks / private callers). It is not disabled by
-        // enabling TLS; front it with a trusted hop if plaintext must not be served.
+        // TLS is on, so the real proxy is served over HTTPS on TLS_PORT. The
+        // plaintext PORT listener stays bound (k8s liveness/readiness probes and
+        // the in-cluster ClusterIP still target it) but must NOT proxy application
+        // traffic in cleartext: it only answers /healthz + /readyz and 308-redirects
+        // every other path to the HTTPS endpoint. No real request is proxied in
+        // cleartext once TLS is enabled.
         let tls_addr = SocketAddr::from(([0, 0, 0, 0], tls.port));
+        tracing::info!(
+            "TLS enabled — HTTPS proxy on port {tls}; plaintext port {port} serves only \
+             /healthz + /readyz and 308-redirects all other paths to https (no cleartext \
+             proxying)",
+            tls = tls.port,
+        );
+        let guard = build_plaintext_guard_app(tls.port);
+        let http = serve_http(http_addr, guard);
         let https = serve_https(tls_addr, app, tls);
         tokio::select! {
             result = http => result?,
@@ -138,9 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::warn!(
             "TLS is disabled (FIDUCIA_TLS_CERT_PATH / FIDUCIA_TLS_KEY_PATH unset) — \
-             serving plaintext HTTP only; terminate TLS here or at a trusted hop \
-             before exposing the LB to untrusted networks"
+             serving plaintext HTTP only (full proxy on port {port}); terminate TLS here \
+             or at a trusted hop before exposing the LB to untrusted networks"
         );
+        let http = serve_http(http_addr, app);
         http.await?;
     }
 
@@ -163,6 +174,85 @@ fn build_app(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new())
+}
+
+/// The router served on the plaintext `PORT` **when TLS is enabled**. It keeps
+/// the k8s probes answerable but refuses to proxy application traffic in
+/// cleartext: every non-probe path is answered with a `308` redirect to the
+/// HTTPS endpoint (falling back to `426 Upgrade Required` when there is no usable
+/// `Host` to build the redirect from). This carries no `AppState` — it never
+/// touches auth, the route table, or an upstream node.
+fn build_plaintext_guard_app(tls_port: u16) -> Router {
+    Router::new()
+        // k8s liveness/readiness probes target these on the plaintext port.
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(healthz))
+        // Everything else must speak HTTPS — never proxied in cleartext.
+        .fallback(move |uri: Uri, headers: HeaderMap| async move {
+            upgrade_to_https(tls_port, uri, headers)
+        })
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
+}
+
+/// Turn a plaintext request into an HTTPS upgrade: `308` (method- and
+/// body-preserving) to the same host on the HTTPS port, or `426 Upgrade Required`
+/// when no usable `Host` header is present to redirect to.
+fn upgrade_to_https(tls_port: u16, uri: Uri, headers: HeaderMap) -> Response {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    match upgrade_location(host, tls_port, path_and_query) {
+        Some(location) => (
+            // 308 keeps the method and body intact, so a mistakenly-plaintext
+            // POST/PUT is re-sent to HTTPS rather than silently downgraded to GET.
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+            .into_response(),
+        None => (
+            StatusCode::UPGRADE_REQUIRED,
+            [(header::UPGRADE, "TLS/1.2, HTTP/1.1")],
+            Json(json!({
+                "error": "https_required",
+                "detail": "cleartext proxying is disabled while TLS is enabled; use https",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Build the `https://` `Location` for a plaintext request that must be upgraded.
+/// Preserves the request's own `Host` (swapping scheme + port), matching the
+/// standard nginx-style HTTP→HTTPS redirect. Returns `None` (→ 426) when there is
+/// no usable host to redirect to.
+fn upgrade_location(host: Option<&str>, tls_port: u16, path_and_query: &str) -> Option<String> {
+    let host = host?.trim();
+    let hostname = strip_host_port(host);
+    if hostname.is_empty() {
+        return None;
+    }
+    let authority = if tls_port == 443 {
+        hostname.to_string()
+    } else {
+        format!("{hostname}:{tls_port}")
+    };
+    Some(format!("https://{authority}{path_and_query}"))
+}
+
+/// Strip a trailing `:port` from a `Host` header value, leaving an IPv6 literal
+/// (`[::1]`) intact.
+fn strip_host_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port` — keep through the closing `]`.
+        return match host.find(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        };
+    }
+    match host.split_once(':') {
+        Some((h, _)) => h,
+        None => host,
+    }
 }
 
 async fn serve_http(
@@ -380,6 +470,63 @@ mod interface_contract_tests {
         assert!(authorize_admin_read(Some(&test_identity(&["admin:write"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:*"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["*"]))).is_ok());
+    }
+
+    #[test]
+    fn plaintext_upgrade_redirects_to_https_preserving_host_and_path() {
+        // Default HTTPS port (443): authority carries no explicit port.
+        assert_eq!(
+            upgrade_location(Some("api.fiducia.cloud"), 443, "/v1/kv/foo?bar=1").as_deref(),
+            Some("https://api.fiducia.cloud/v1/kv/foo?bar=1"),
+        );
+        // Non-standard TLS_PORT is appended (in-cluster ClusterIP case).
+        assert_eq!(
+            upgrade_location(
+                Some("fiducia-load-balance-internal.fiducia.svc.cluster.local:8088"),
+                8443,
+                "/v1/locks/checkout",
+            )
+            .as_deref(),
+            Some("https://fiducia-load-balance-internal.fiducia.svc.cluster.local:8443/v1/locks/checkout"),
+        );
+        // IPv6 literal host keeps its brackets.
+        assert_eq!(
+            upgrade_location(Some("[::1]:8088"), 8443, "/healthz").as_deref(),
+            Some("https://[::1]:8443/healthz"),
+        );
+        // No / empty Host ⇒ no redirect target ⇒ caller returns 426.
+        assert_eq!(upgrade_location(None, 8443, "/v1/kv/foo"), None);
+        assert_eq!(upgrade_location(Some("   "), 8443, "/v1/kv/foo"), None);
+    }
+
+    #[test]
+    fn plaintext_guard_serves_probes_but_upgrades_everything_else() {
+        // 308 is method/body preserving so a plaintext mutation is re-sent, not
+        // downgraded to GET.
+        let resp = upgrade_to_https(
+            8443,
+            "/v1/kv/foo?x=1".parse().unwrap(),
+            host_headers("lb.internal:8088"),
+        );
+        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "https://lb.internal:8443/v1/kv/foo?x=1",
+        );
+
+        // Missing Host ⇒ 426 Upgrade Required (still no cleartext proxying).
+        let resp = upgrade_to_https(8443, "/v1/kv/foo".parse().unwrap(), HeaderMap::new());
+        assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+
+        // The guard router only registers the two probe routes as real handlers;
+        // building it must not panic.
+        let _ = build_plaintext_guard_app(8443);
+    }
+
+    fn host_headers(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers
     }
 
     fn test_identity(scopes: &[&str]) -> auth::VerifiedIdentity {
