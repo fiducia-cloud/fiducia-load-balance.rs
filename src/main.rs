@@ -125,10 +125,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if let Some(tls) = tls_settings()? {
-        // NOTE: the plaintext HTTP listener on PORT stays open alongside TLS_PORT
-        // (in-cluster health checks / private callers). It is not disabled by
-        // enabling TLS; front it with a trusted hop if plaintext must not be served.
+        // TLS is on, so the real proxy is served over HTTPS on TLS_PORT. The
+        // plaintext PORT listener stays bound (k8s liveness/readiness probes and
+        // the in-cluster ClusterIP still target it) but must NOT proxy application
+        // traffic in cleartext: it only answers /healthz + /readyz and 308-redirects
+        // every other path to the HTTPS endpoint. No real request is proxied in
+        // cleartext once TLS is enabled.
         let tls_addr = SocketAddr::from(([0, 0, 0, 0], tls.port));
+        tracing::info!(
+            "TLS enabled — HTTPS proxy on port {tls}; plaintext port {port} serves only \
+             /healthz + /readyz and 308-redirects all other paths to https (no cleartext \
+             proxying)",
+            tls = tls.port,
+        );
+        let guard = build_plaintext_guard_app(tls.port);
+        let http = serve_http(http_addr, guard);
         let https = serve_https(tls_addr, app, tls);
         tokio::select! {
             result = http => result?,
@@ -137,9 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::warn!(
             "TLS is disabled (FIDUCIA_TLS_CERT_PATH / FIDUCIA_TLS_KEY_PATH unset) — \
-             serving plaintext HTTP only; terminate TLS here or at a trusted hop \
-             before exposing the LB to untrusted networks"
+             serving plaintext HTTP only (full proxy on port {port}); terminate TLS here \
+             or at a trusted hop before exposing the LB to untrusted networks"
         );
+        let http = serve_http(http_addr, app);
         http.await?;
     }
 
