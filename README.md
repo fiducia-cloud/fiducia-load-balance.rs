@@ -141,7 +141,7 @@ immutable sibling revisions for the local path dependencies:
 - `fiducia-interfaces` at
   `5f2c5279ee19941024455b2843256872485bac82`
 - `fiducia-routing.rs` at
-  `30b65cddec7227d038ee804682dba6d37e62f5f7`
+  `1615b208d3765df1f69f0b3ec26180b263ef7aad`
 
 When either shared contract changes, update the checkout refs in
 `.github/workflows/ci.yml`, the build arguments in `.github/workflows/docker.yml`,
