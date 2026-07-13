@@ -23,8 +23,8 @@ jobs:
           context: .
           push: true
           build-args: |
-            INTERFACES_REF=5f2c5279ee19941024455b2843256872485bac82
-            ROUTING_REF=1615b208d3765df1f69f0b3ec26180b263ef7aad
+            INTERFACES_REF=487e470c45ab5851e8f6f3b1dc048fe067fbf408
+            ROUTING_REF=6106b4f79a5559699a64c931dbcb472f42274266
           tags: |
             ghcr.io/fiducia-cloud/fiducia-load-balance:latest
             ghcr.io/fiducia-cloud/fiducia-load-balance:${{ github.sha }}
