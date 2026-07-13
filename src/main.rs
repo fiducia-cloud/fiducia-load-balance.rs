@@ -110,7 +110,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8088);
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let http = serve_http(http_addr, app.clone());
 
     // Loud, explicit warning for the opt-in trust-boundary mode: with no shared
     // secret the LB will NOT trust edge-forwarded `x-fiducia-*` identities (they
