@@ -328,8 +328,16 @@ async fn resolve(
 }
 
 fn authorize_admin_read(identity: Option<&auth::VerifiedIdentity>) -> Result<(), ()> {
+    // Fail CLOSED for an absent identity. `/_lb/routes` and `/_lb/resolve` expose
+    // internal topology (node URLs/IPs, regions, cloud providers, cluster IDs, and
+    // the shard→leader map), so an unauthenticated caller must not read them — the
+    // same fail-closed rule the proxy path applies to scoped routes. (When
+    // `FIDUCIA_AUTH_REQUIRED` is false, `authenticate` yields `None` for a
+    // credential-less request; without this guard these debug routes would leak
+    // cluster topology to any anonymous client, including one reaching the LB
+    // through the edge.)
     let Some(identity) = identity else {
-        return Ok(());
+        return Err(());
     };
 
     if identity.scopes.iter().any(|scope| {
@@ -413,8 +421,10 @@ mod interface_contract_tests {
     }
 
     #[test]
-    fn lb_operator_routes_require_admin_read_scope_when_authenticated() {
-        assert!(authorize_admin_read(None).is_ok());
+    fn lb_operator_routes_require_admin_read_scope_and_fail_closed_when_anonymous() {
+        // An absent identity (anonymous, e.g. when FIDUCIA_AUTH_REQUIRED is off)
+        // must NOT read the internal-topology debug routes — fail closed.
+        assert!(authorize_admin_read(None).is_err());
         assert!(authorize_admin_read(Some(&test_identity(&["kv:read"]))).is_err());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:read"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:write"]))).is_ok());
