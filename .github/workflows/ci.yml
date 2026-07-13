@@ -23,12 +23,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
-          ref: bbd8b52ce729ec34b0a9bff4dda6d0a448181797
+          ref: 5f2c5279ee19941024455b2843256872485bac82
           path: fiducia-interfaces
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-routing.rs
-          ref: f0c86c2736b61cf3af7fa298a092fa435069cd64
+          ref: 30b65cddec7227d038ee804682dba6d37e62f5f7
           path: fiducia-routing.rs
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
