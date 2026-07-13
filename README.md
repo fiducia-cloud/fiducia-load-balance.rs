@@ -139,7 +139,7 @@ mapped to these vars with `flags-2-env` (see below).
 
 | Variable | Type | Default | Secret? | Meaning |
 |----------|------|---------|:-------:|---------|
-| `PORT` | integer | `8088` | no | Plain HTTP listen port (always open, even when TLS is on). |
+| `PORT` | integer | `8088` | no | Plain HTTP listen port (always bound). When TLS is on it serves only `/healthz` + `/readyz` and `308`-redirects everything else to HTTPS — no cleartext proxying. |
 | `TLS_PORT` | integer | `8443` | no | HTTPS listen port; only used when both TLS paths are set. |
 | `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Shard count; must match the data plane, or keys route to the wrong shard. |
 | `FIDUCIA_NODES` | string | *(empty)* | no | Comma-separated seed node base URLs (provisional leaders until brain refresh). |
