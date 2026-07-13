@@ -2,8 +2,7 @@
 #
 # Required secrets (repo Settings -> Secrets and variables -> Actions):
 #   KUBE_CONFIG_TEST  base64-encoded kubeconfig with access to the `fiducia-test`
-#                     namespace. When absent, this workflow is a no-op
-#                     (validation-only) -- nothing is deployed.
+#                     namespace. Missing or blank credentials fail the job.
 #
 # Topology: app repos deploy to the TEST environment from their own CI; the
 # fiducia-monorepo is the only PROD deploy. This is the TEST half for this
@@ -29,7 +28,20 @@ jobs:
         env:
           KUBE_CONFIG_TEST: ${{ secrets.KUBE_CONFIG_TEST }}
         run: |
-          if [ -z "$KUBE_CONFIG_TEST" ]; then echo "no KUBE_CONFIG_TEST secret — skipping test deploy (validation-only)"; exit 0; fi
-          echo "$KUBE_CONFIG_TEST" | base64 -d > /tmp/kubeconfig; export KUBECONFIG=/tmp/kubeconfig
+          set -euo pipefail
+          if [ -z "${KUBE_CONFIG_TEST//[[:space:]]/}" ]; then
+            echo "::error::KUBE_CONFIG_TEST must contain a base64-encoded kubeconfig"
+            exit 1
+          fi
+
+          install -d -m 700 "$RUNNER_TEMP/fiducia-kube"
+          export KUBECONFIG="$RUNNER_TEMP/fiducia-kube/config"
+          install -m 600 /dev/null "$KUBECONFIG"
+          printf '%s' "$KUBE_CONFIG_TEST" | base64 --decode | tee "$KUBECONFIG" >/dev/null
+          if [ ! -s "$KUBECONFIG" ]; then
+            echo "::error::KUBE_CONFIG_TEST decoded to an empty kubeconfig"
+            exit 1
+          fi
+
           kubectl -n fiducia-test set image deploy/fiducia-load-balance fiducia-load-balance=ghcr.io/fiducia-cloud/fiducia-load-balance:${{ github.sha }}
           kubectl -n fiducia-test rollout status deploy/fiducia-load-balance --timeout=5m

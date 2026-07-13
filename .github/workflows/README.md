@@ -9,7 +9,7 @@ GitHub Actions pipelines for the load balancer.
 - `docker.yml` — build and publish the non-root container image on pushes to
   `main`, using those same immutable sibling revisions.
 - `deploy-test.yml` — secret-gated deploy to the `fiducia-test` Kubernetes
-  environment; it skips only when `KUBE_CONFIG_TEST` is absent and otherwise
-  fails if the target is missing or the rollout does not complete.
+  environment; `KUBE_CONFIG_TEST` is mandatory, and missing, invalid, or empty
+  credentials, a missing target, or an incomplete rollout fail the job.
 - `cli-flags.yml` — audits `.cli-flags.toml` with the pinned `flags2env`
   submodule whenever the CLI flag schema, scripts, or submodule change.

@@ -123,7 +123,7 @@ closed (see the trust boundary below), so use a credential or hit the public
 routes when exercising the proxy:
 
 ```bash
-FIDUCIA_NODES=http://localhost:8090 FIDUCIA_SHARD_COUNT=4 cargo run   # :8088 (override PORT)
+FIDUCIA_NODES=http://localhost:8090 FIDUCIA_SHARD_COUNT=4 cargo run --locked   # :8088 (override PORT)
 curl 'localhost:8088/healthz'
 curl 'localhost:8088/_lb/resolve?path=/v1/locks/checkout'   # operator route (admin scope if authed)
 curl  localhost:8088/_lb/routes
@@ -243,7 +243,7 @@ git submodule update --init vendor/flags-2-env
 make -B -C vendor/flags-2-env all
 
 # Run the binary with flags translated into env vars:
-scripts/with-flags2env.sh --shards 4 --nodes http://localhost:8090 -- cargo run
+scripts/with-flags2env.sh --shards 4 --nodes http://localhost:8090 -- cargo run --locked
 
 # Validate the schema:
 vendor/flags-2-env/build/flags2env audit .cli-flags.toml
