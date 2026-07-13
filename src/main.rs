@@ -421,8 +421,10 @@ mod interface_contract_tests {
     }
 
     #[test]
-    fn lb_operator_routes_require_admin_read_scope_when_authenticated() {
-        assert!(authorize_admin_read(None).is_ok());
+    fn lb_operator_routes_require_admin_read_scope_and_fail_closed_when_anonymous() {
+        // An absent identity (anonymous, e.g. when FIDUCIA_AUTH_REQUIRED is off)
+        // must NOT read the internal-topology debug routes — fail closed.
+        assert!(authorize_admin_read(None).is_err());
         assert!(authorize_admin_read(Some(&test_identity(&["kv:read"]))).is_err());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:read"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:write"]))).is_ok());
