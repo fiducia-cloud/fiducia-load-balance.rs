@@ -23,13 +23,16 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
+          ref: bbd8b52ce729ec34b0a9bff4dda6d0a448181797
           path: fiducia-interfaces
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-routing.rs
+          ref: f0c86c2736b61cf3af7fa298a092fa435069cd64
           path: fiducia-routing.rs
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: "1.95.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -41,18 +44,16 @@ jobs:
           vendor/flags-2-env/build/flags2env audit .cli-flags.toml
       - name: fmt
         working-directory: repo
-        run: cargo fmt --check
-        continue-on-error: true
+        run: cargo fmt --all -- --check
       - name: clippy
         working-directory: repo
-        run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: test
         working-directory: repo
-        run: cargo test --bins $(cargo build --lib --quiet 2>/dev/null && echo --lib)
+        run: cargo test --locked --all-targets
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.21.2
       - name: audit
         working-directory: repo
-        run: |
-          cargo install cargo-audit --locked || true
-          cargo audit
-        continue-on-error: true
+        run: cargo audit

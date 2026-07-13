@@ -133,6 +133,23 @@ On startup with no `FIDUCIA_INTERNAL_SECRET` and no TLS paths the LB logs loud
 `WARN`s that it is running in plaintext, secret-less dev mode — expected locally,
 never in production.
 
+## Reproducible build inputs
+
+CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
+immutable sibling revisions for the local path dependencies:
+
+- `fiducia-interfaces` at
+  `bbd8b52ce729ec34b0a9bff4dda6d0a448181797`
+- `fiducia-routing.rs` at
+  `f0c86c2736b61cf3af7fa298a092fa435069cd64`
+
+When either shared contract changes, update the checkout refs in
+`.github/workflows/ci.yml`, the build arguments in `.github/workflows/docker.yml`,
+and the defaults in `Dockerfile` together. Cargo formatting, clippy, tests, and
+release builds run with the lockfile enforced; dependency-audit failures block
+CI. Docker build and runtime bases are pinned by multi-platform manifest digest,
+and the final image runs as the distroless non-root uid/gid `65532:65532`.
+
 ## Configuration surface
 
 All configuration is via environment variables (secrets are marked). Flags can be
