@@ -12,16 +12,19 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           push: true
+          build-args: |
+            INTERFACES_REF=487e470c45ab5851e8f6f3b1dc048fe067fbf408
+            ROUTING_REF=6106b4f79a5559699a64c931dbcb472f42274266
           tags: |
             ghcr.io/fiducia-cloud/fiducia-load-balance:latest
             ghcr.io/fiducia-cloud/fiducia-load-balance:${{ github.sha }}

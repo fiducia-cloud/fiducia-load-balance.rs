@@ -16,37 +16,44 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           path: repo
-      - uses: actions/checkout@v7
+          submodules: recursive
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
+          ref: 487e470c45ab5851e8f6f3b1dc048fe067fbf408
           path: fiducia-interfaces
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-routing.rs
+          ref: 6106b4f79a5559699a64c931dbcb472f42274266
           path: fiducia-routing.rs
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: "1.95.0"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: repo
-      - name: fmt
-        working-directory: repo
-        run: cargo fmt --check
-        continue-on-error: true
-      - name: clippy
-        working-directory: repo
-        run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true
-      - name: test
-        working-directory: repo
-        run: cargo test --bins $(cargo build --lib --quiet 2>/dev/null && echo --lib)
-      - name: audit
+      - name: CLI flag contract
         working-directory: repo
         run: |
-          cargo install cargo-audit --locked || true
-          cargo audit
-        continue-on-error: true
+          make -B -C vendor/flags-2-env all
+          vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+      - name: fmt
+        working-directory: repo
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: repo
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: test
+        working-directory: repo
+        run: cargo test --locked --all-targets
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: audit
+        working-directory: repo
+        run: cargo audit

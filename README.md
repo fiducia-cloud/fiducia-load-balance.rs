@@ -72,8 +72,9 @@ TLS termination can happen at this LB: set `FIDUCIA_TLS_CERT_PATH` and
 `FIDUCIA_TLS_KEY_PATH` and it will listen on `TLS_PORT` (default `8443`) with
 Rustls. When TLS is on, the plaintext `PORT` listener stays bound for k8s probes
 but **stops proxying application traffic in cleartext**: it answers `/healthz` and
-`/readyz`, and `308`-redirects every other path to the HTTPS endpoint (`426
-Upgrade Required` when there is no `Host` to redirect to). If Cloudflare is later
+`/readyz`, and rejects every other path with `426 Upgrade Required`. It does not
+construct redirects from an untrusted `Host` header, so a credential-bearing
+mutation cannot be redirected to an attacker-controlled authority. If Cloudflare is later
 enabled in front of it, use Cloudflare in "Full (strict)" mode and point the
 origin at the LB HTTPS port; do not route Cloudflare directly to node pods.
 
@@ -122,7 +123,7 @@ closed (see the trust boundary below), so use a credential or hit the public
 routes when exercising the proxy:
 
 ```bash
-FIDUCIA_NODES=http://localhost:8090 FIDUCIA_SHARD_COUNT=4 cargo run   # :8088 (override PORT)
+FIDUCIA_NODES=http://localhost:8090 FIDUCIA_SHARD_COUNT=4 cargo run --locked   # :8088 (override PORT)
 curl 'localhost:8088/healthz'
 curl 'localhost:8088/_lb/resolve?path=/v1/locks/checkout'   # operator route (admin scope if authed)
 curl  localhost:8088/_lb/routes
@@ -132,6 +133,23 @@ On startup with no `FIDUCIA_INTERNAL_SECRET` and no TLS paths the LB logs loud
 `WARN`s that it is running in plaintext, secret-less dev mode — expected locally,
 never in production.
 
+## Reproducible build inputs
+
+CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
+immutable sibling revisions for the local path dependencies:
+
+- `fiducia-interfaces` at
+  `487e470c45ab5851e8f6f3b1dc048fe067fbf408`
+- `fiducia-routing.rs` at
+  `6106b4f79a5559699a64c931dbcb472f42274266`
+
+When either shared contract changes, update the checkout refs in
+`.github/workflows/ci.yml`, the build arguments in `.github/workflows/docker.yml`,
+and the defaults in `Dockerfile` together. Cargo formatting, clippy, tests, and
+release builds run with the lockfile enforced; dependency-audit failures block
+CI. Docker build and runtime bases are pinned by multi-platform manifest digest,
+and the final image runs as the distroless non-root uid/gid `65532:65532`.
+
 ## Configuration surface
 
 All configuration is via environment variables (secrets are marked). Flags can be
@@ -139,7 +157,7 @@ mapped to these vars with `flags-2-env` (see below).
 
 | Variable | Type | Default | Secret? | Meaning |
 |----------|------|---------|:-------:|---------|
-| `PORT` | integer | `8088` | no | Plain HTTP listen port (always bound). When TLS is on it serves only `/healthz` + `/readyz` and `308`-redirects everything else to HTTPS — no cleartext proxying. |
+| `PORT` | integer | `8088` | no | Plain HTTP listen port (always bound). When TLS is on it serves only `/healthz` + `/readyz` and rejects everything else with `426` — no cleartext proxying or Host-derived redirect. |
 | `TLS_PORT` | integer | `8443` | no | HTTPS listen port; only used when both TLS paths are set. |
 | `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Shard count; must match the data plane, or keys route to the wrong shard. |
 | `FIDUCIA_NODES` | string | *(empty)* | no | Comma-separated seed node base URLs (provisional leaders until brain refresh). |
@@ -203,32 +221,37 @@ The LB authenticates at the boundary and **fails closed**:
 - **The plaintext `PORT` listener never proxies application traffic in cleartext
   once TLS is on.** It stays bound (k8s liveness/readiness probes and the
   in-cluster ClusterIP target it) but only answers `/healthz` + `/readyz`; every
-  other path gets a `308` redirect to the same host on HTTPS (method- and
-  body-preserving), or `426 Upgrade Required` when no `Host` is present. So an
-  attacker cannot get a real request proxied over cleartext even on the internal
-  port. The guard listener carries no auth/route-table state and never contacts a
-  node. With no TLS paths set the LB serves the **full proxy in plaintext only**
+  other path gets `426 Upgrade Required`. The listener never trusts a caller's
+  `Host` header to redirect a credential-bearing request. An attacker therefore
+  cannot get a real request proxied over cleartext—or redirected to another
+  authority—even on the internal port. The guard listener carries no
+  auth/route-table state and never contacts a node. With no TLS paths set the LB
+  serves the **full proxy in plaintext only**
   (dev) and logs a loud `WARN` at startup.
 - Cert/key files are read from disk with no explicit permission check — mount them
   from a secret store with restrictive file modes.
 
 ## flags-2-env
 
-CLI flags can be bridged to the `FIDUCIA_*` / `PORT` env vars above through the
+Non-secret settings can be bridged to the `FIDUCIA_*` / `PORT` env vars above through the
 pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
 (vendored as a git submodule under `vendor/flags-2-env`). The mapping lives in
 [`.cli-flags.toml`](.cli-flags.toml) and is audited in CI (`cli-flags.yml`).
 
 ```bash
 git submodule update --init vendor/flags-2-env
-make -C vendor/flags-2-env all        # build the parser (prebuilt may already exist)
+make -B -C vendor/flags-2-env all
 
 # Run the binary with flags translated into env vars:
-scripts/with-flags2env.sh --shards 4 --nodes http://localhost:8090 -- cargo run
+scripts/with-flags2env.sh --shards 4 --nodes http://localhost:8090 -- cargo run --locked
 
 # Validate the schema:
 vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 ```
+
+`FIDUCIA_INTERNAL_SECRET` and `FIDUCIA_INTROSPECT_SECRET` are deliberately
+excluded from the CLI schema. Inject them through the environment or a secret
+store so they cannot leak through shell history or process listings.
 
 ## Security
 
@@ -254,4 +277,4 @@ Accepted / known advisories (`cargo audit` is otherwise clean):
 
 - [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (sharded coordination engine).
 - [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) — control plane (placement, scaling, failure handling).
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website webserver.
+- [`fiducia-customer.rs`](https://github.com/fiducia-cloud/fiducia-customer.rs) — the website webserver.
