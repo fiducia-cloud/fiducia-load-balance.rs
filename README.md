@@ -200,11 +200,15 @@ The LB authenticates at the boundary and **fails closed**:
   `FIDUCIA_TLS_KEY_PATH` are set; setting only one is a hard startup error.
   It listens on `TLS_PORT` with Rustls (ring provider, safe TLS 1.2/1.3 defaults;
   no weakened cipher/version config).
-- **The plaintext `PORT` listener stays open alongside `TLS_PORT`** — enabling TLS
-  does not close it (it serves in-cluster health checks / private callers). If
-  plaintext must never be served to untrusted networks, front the LB with a
-  trusted hop and expose only the HTTPS port. With no TLS paths set the LB serves
-  **plaintext only** and logs a loud `WARN` at startup.
+- **The plaintext `PORT` listener never proxies application traffic in cleartext
+  once TLS is on.** It stays bound (k8s liveness/readiness probes and the
+  in-cluster ClusterIP target it) but only answers `/healthz` + `/readyz`; every
+  other path gets a `308` redirect to the same host on HTTPS (method- and
+  body-preserving), or `426 Upgrade Required` when no `Host` is present. So an
+  attacker cannot get a real request proxied over cleartext even on the internal
+  port. The guard listener carries no auth/route-table state and never contacts a
+  node. With no TLS paths set the LB serves the **full proxy in plaintext only**
+  (dev) and logs a loud `WARN` at startup.
 - Cert/key files are read from disk with no explicit permission check — mount them
   from a secret store with restrictive file modes.
 
