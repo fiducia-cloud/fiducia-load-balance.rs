@@ -1,0 +1,144 @@
+# Non-secret command-line configuration for fiducia-load-balance. Authentication
+# secrets remain environment-only.
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-load-balance.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = ["FIDUCIA_INTERNAL_SECRET", "FIDUCIA_INTROSPECT_SECRET"]
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+short = "p"
+type = "integer"
+help = "HTTP listen port."
+
+[flags.tls-port]
+env = "TLS_PORT"
+aliases = ["tls-port"]
+type = "integer"
+help = "HTTPS listen port."
+
+[flags.tls-cert-path]
+env = "FIDUCIA_TLS_CERT_PATH"
+aliases = ["tls-cert-path"]
+type = "string"
+help = "TLS certificate path."
+
+[flags.tls-key-path]
+env = "FIDUCIA_TLS_KEY_PATH"
+aliases = ["tls-key-path"]
+type = "string"
+help = "TLS private-key path."
+
+[flags.shard-count]
+env = "FIDUCIA_SHARD_COUNT"
+aliases = ["shard-count"]
+type = "integer"
+help = "Number of logical shards."
+
+[flags.nodes]
+env = "FIDUCIA_NODES"
+aliases = ["nodes"]
+type = "string"
+help = "Comma-separated data-plane node URLs."
+
+[flags.brain-url]
+env = "FIDUCIA_BRAIN_URL"
+aliases = ["brain-url"]
+type = "string"
+help = "Brain service base URL."
+
+[flags.brain-refresh-timeout-secs]
+env = "FIDUCIA_BRAIN_REFRESH_TIMEOUT_SECS"
+aliases = ["brain-refresh-timeout-secs"]
+type = "integer"
+help = "Brain topology refresh timeout in seconds."
+
+[flags.auth-required]
+env = "FIDUCIA_AUTH_REQUIRED"
+aliases = ["auth-required"]
+type = "bool"
+help = "Require authentication on public data-plane routes."
+
+[flags.auth-allow-api-keys]
+env = "FIDUCIA_AUTH_ALLOW_API_KEYS"
+aliases = ["auth-allow-api-keys"]
+type = "bool"
+help = "Allow API-key authentication."
+
+[flags.auth-allow-jwts]
+env = "FIDUCIA_AUTH_ALLOW_JWTS"
+aliases = ["auth-allow-jwts"]
+type = "bool"
+help = "Allow JWT authentication."
+
+[flags.auth-url]
+env = "FIDUCIA_AUTH_URL"
+aliases = ["auth-url"]
+type = "string"
+help = "Authentication service base URL."
+
+[flags.auth-introspect-url]
+env = "FIDUCIA_AUTH_INTROSPECT_URL"
+aliases = ["auth-introspect-url"]
+type = "string"
+help = "Authentication introspection endpoint."
+
+[flags.auth-jwks-url]
+env = "FIDUCIA_AUTH_JWKS_URL"
+aliases = ["auth-jwks-url"]
+type = "string"
+help = "JWKS endpoint."
+
+[flags.jwt-issuer]
+env = "FIDUCIA_JWT_ISSUER"
+aliases = ["jwt-issuer"]
+type = "string"
+help = "Required JWT issuer."
+
+[flags.jwt-audience]
+env = "FIDUCIA_JWT_AUDIENCE"
+aliases = ["jwt-audience"]
+type = "string"
+help = "Required JWT audience."
+
+[flags.auth-cache-ttl-secs]
+env = "FIDUCIA_AUTH_CACHE_TTL_SECS"
+aliases = ["auth-cache-ttl-secs"]
+type = "integer"
+help = "Positive authentication cache lifetime in seconds."
+
+[flags.auth-negative-cache-ttl-secs]
+env = "FIDUCIA_AUTH_NEGATIVE_CACHE_TTL_SECS"
+aliases = ["auth-negative-cache-ttl-secs"]
+type = "integer"
+help = "Negative authentication cache lifetime in seconds."
+
+[flags.auth-jwks-ttl-secs]
+env = "FIDUCIA_AUTH_JWKS_TTL_SECS"
+aliases = ["auth-jwks-ttl-secs"]
+type = "integer"
+help = "JWKS cache lifetime in seconds."
+
+[flags.auth-jwt-cache-ttl-secs]
+env = "FIDUCIA_AUTH_JWT_CACHE_TTL_SECS"
+aliases = ["auth-jwt-cache-ttl-secs"]
+type = "integer"
+help = "Validated JWT cache lifetime in seconds."
+
+[flags.auth-http-timeout-secs]
+env = "FIDUCIA_AUTH_HTTP_TIMEOUT_SECS"
+aliases = ["auth-http-timeout-secs"]
+type = "integer"
+help = "Authentication HTTP timeout in seconds."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."

@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: repo
+          submodules: recursive
       - uses: actions/checkout@v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
@@ -33,6 +34,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: repo
+      - name: CLI flag contract
+        working-directory: repo
+        run: |
+          make -B -C vendor/flags-2-env all
+          vendor/flags-2-env/build/flags2env audit .cli-flags.toml
       - name: fmt
         working-directory: repo
         run: cargo fmt --check

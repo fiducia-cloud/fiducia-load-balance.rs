@@ -119,6 +119,16 @@ curl 'localhost:8088/_lb/resolve?path=/v1/locks/checkout'
 curl  localhost:8088/_lb/routes
 ```
 
+Use the pinned parser when CLI flags are more convenient than direct environment
+configuration:
+
+```bash
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh --port=8088 --shard-count=4 --nodes=http://localhost:8090 -- cargo run --locked
+```
+
+Shared authentication secrets remain environment-only.
+
 Env:
 
 - `PORT`, `FIDUCIA_SHARD_COUNT`, `FIDUCIA_NODES` (comma-separated node URLs),

@@ -1236,7 +1236,10 @@ mod tests {
         read_only.insert("x-fiducia-org-id", "org_1".parse().unwrap());
         read_only.insert("x-fiducia-scopes", "kv:read".parse().unwrap());
         let identity = crate::auth::trusted_edge_identity(&read_only, Some(secret));
-        assert!(identity.is_some(), "valid secret must yield a trusted identity");
+        assert!(
+            identity.is_some(),
+            "valid secret must yield a trusted identity"
+        );
         let denied = route(
             table.clone(),
             identity,
