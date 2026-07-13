@@ -200,11 +200,20 @@ fn authorize_route(
     uri: &Uri,
 ) -> Result<(), ScopeFailure> {
     let required = required_scopes_for_route(method, uri);
-    if required.is_empty() || identity.is_none() {
+    // Public / read-safe routes (no required scopes, e.g. healthz) stay open to
+    // anonymous callers.
+    if required.is_empty() {
         return Ok(());
     }
 
-    let identity = identity.expect("checked is_some");
+    // A scoped route with no verified identity fails CLOSED — regardless of
+    // `FIDUCIA_AUTH_REQUIRED`. This closes the bypass where an edge-forwarded (or
+    // otherwise credential-less) request would reach a mutating/admin route with
+    // `identity = None` and previously be blanket-allowed, then forwarded to the
+    // node under the LB's trusted internal secret.
+    let Some(identity) = identity else {
+        return Err(ScopeFailure { required });
+    };
     if has_any_scope(identity, required) {
         return Ok(());
     }
@@ -1206,7 +1215,87 @@ mod tests {
         assert!(authorize_route(Some(&admin_read), &Method::GET, &read_uri).is_ok());
         assert!(authorize_route(Some(&admin_read), &Method::PUT, &write_uri).is_err());
         assert!(authorize_route(Some(&admin_write), &Method::PUT, &write_uri).is_ok());
-        assert!(authorize_route(None, &Method::PUT, &write_uri).is_ok());
+        // Anonymous callers are allowed on public routes only; a scoped route now
+        // fails closed instead of blanket-allowing an absent identity.
+        assert!(authorize_route(None, &Method::PUT, &write_uri).is_err());
+        assert!(authorize_route(None, &Method::GET, &read_uri).is_err());
+        assert!(authorize_route(None, &Method::GET, &"/healthz".parse().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn edge_forwarded_request_with_secret_is_trusted_and_scope_checked() {
+        let (table, fake, server) = fake_cluster().await;
+        let secret = "edge-secret";
+
+        // The edge presents a pre-verified identity plus the shared secret. The
+        // identity is trusted, but `kv:read` cannot perform a KV write → 403, and
+        // nothing reaches the node.
+        let mut read_only = HeaderMap::new();
+        read_only.insert(crate::auth::EDGE_AUTH_HEADER, secret.parse().unwrap());
+        read_only.insert("x-fiducia-auth-kind", "api_key".parse().unwrap());
+        read_only.insert("x-fiducia-org-id", "org_1".parse().unwrap());
+        read_only.insert("x-fiducia-scopes", "kv:read".parse().unwrap());
+        let identity = crate::auth::trusted_edge_identity(&read_only, Some(secret));
+        assert!(identity.is_some(), "valid secret must yield a trusted identity");
+        let denied = route(
+            table.clone(),
+            identity,
+            Method::PUT,
+            "/v1/kv?key=orders%2F1".parse().unwrap(),
+            read_only,
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(fake.mutation_count(), 0);
+
+        // Same trusted hop, now with `kv:write` → the write is authorized and
+        // forwarded to the node.
+        let mut writable = HeaderMap::new();
+        writable.insert(crate::auth::EDGE_AUTH_HEADER, secret.parse().unwrap());
+        writable.insert("x-fiducia-org-id", "org_1".parse().unwrap());
+        writable.insert("x-fiducia-scopes", "kv:write".parse().unwrap());
+        let identity = crate::auth::trusted_edge_identity(&writable, Some(secret));
+        let allowed = route(
+            table,
+            identity,
+            Method::PUT,
+            "/v1/kv?key=orders%2F1".parse().unwrap(),
+            writable,
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(fake.mutation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn edge_headers_without_the_secret_are_anonymous_and_rejected_for_scoped_route() {
+        let (table, fake, server) = fake_cluster().await;
+
+        // Forged identity headers, but no valid edge secret → not trusted, so the
+        // request is anonymous and a scoped write fails closed with no node hit.
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert("x-fiducia-org-id", "org_evil".parse().unwrap());
+        spoofed.insert("x-fiducia-scopes", "admin:write".parse().unwrap());
+        let identity = crate::auth::trusted_edge_identity(&spoofed, Some("real-secret"));
+        assert!(identity.is_none(), "missing secret must not be trusted");
+
+        let response = route(
+            table,
+            identity,
+            Method::PUT,
+            "/v1/kv?key=orders%2F1".parse().unwrap(),
+            spoofed,
+            Bytes::from_static(br#"{"value":"x"}"#),
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(fake.mutation_count(), 0);
     }
 
     #[tokio::test]
@@ -1478,11 +1567,14 @@ mod tests {
     #[tokio::test]
     async fn customer_idempotency_rejects_blank_or_oversized_keys_before_routing() {
         let table = Arc::new(RouteTable::new(4, vec![]));
+        // A scoped write is now rejected for an anonymous caller before key
+        // validation, so use an authorized identity to reach that validation.
+        let locks_writer = test_identity_with_scopes("org_1", &["locks:write"]);
         let mut blank = HeaderMap::new();
         blank.insert(IDEMPOTENCY_KEY_HEADER, "   ".parse().unwrap());
         let response = route(
             table.clone(),
-            None,
+            Some(locks_writer.clone()),
             Method::POST,
             "/v1/locks/acquire".parse().unwrap(),
             blank,
@@ -1498,7 +1590,7 @@ mod tests {
         long.insert(IDEMPOTENCY_KEY_HEADER, key.parse().unwrap());
         let response = route(
             table.clone(),
-            None,
+            Some(locks_writer.clone()),
             Method::POST,
             "/v1/locks/acquire".parse().unwrap(),
             long,
@@ -1514,7 +1606,7 @@ mod tests {
         );
         let response = route(
             table,
-            None,
+            Some(locks_writer),
             Method::POST,
             "/v1/locks/acquire".parse().unwrap(),
             non_text,
