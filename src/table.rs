@@ -3,7 +3,7 @@
 //! The LB's cache of "who leads shard N right now". It is **allowed to be
 //! stale**: the fast path uses it to route straight to a leader, and when it's
 //! wrong the node redirects (`NotLeader`) and we self-correct via
-//! [`note_leader`](RouteTable::note_leader). Seeded from the control plane
+//! a validated leader hint. Seeded from the control plane
 //! (`fiducia-brain`'s `/v1/placement`) and refreshed periodically.
 //!
 //! Stateless w.r.t. consensus — just a cache — so any number of LB instances can
@@ -76,13 +76,27 @@ impl RouteTable {
         self.inner.read().unwrap().leaders.get(&shard).cloned()
     }
 
-    /// Record a corrected leader (learned from a `NotLeader` redirect).
-    pub fn note_leader(&self, shard: ShardId, node_url: String) {
+    /// Accept a corrected leader only when it is already in the healthy
+    /// membership learned from configuration/brain. Redirects are data-plane
+    /// input; allowing one to add an arbitrary URL would forward the trusted-hop
+    /// secret to an attacker-controlled host.
+    pub fn accept_leader_hint(&self, shard: ShardId, node_url: &str) -> Option<String> {
+        let normalized = normalize_node_url(node_url)?;
         let mut inner = self.inner.write().unwrap();
-        if !inner.nodes.contains(&node_url) {
-            inner.nodes.push(node_url.clone());
-        }
-        inner.leaders.insert(shard, node_url);
+        let known = inner.nodes.iter().find_map(|node| {
+            (normalize_node_url(node).as_deref() == Some(&normalized)).then(|| node.clone())
+        })?;
+        inner.leaders.insert(shard, known.clone());
+        Some(known)
+    }
+
+    /// Validate a keyless redirect target without changing a shard entry.
+    pub fn validate_node_hint(&self, node_url: &str) -> Option<String> {
+        let normalized = normalize_node_url(node_url)?;
+        let inner = self.inner.read().unwrap();
+        inner.nodes.iter().find_map(|node| {
+            (normalize_node_url(node).as_deref() == Some(&normalized)).then(|| node.clone())
+        })
     }
 
     /// Count a routed request against the resolved leader's region.
@@ -371,14 +385,19 @@ mod tests {
     }
 
     #[test]
-    fn note_leader_corrects_the_cache_and_learns_unknown_nodes() {
-        let table = RouteTable::new(8, vec!["http://a:8090".to_string()]);
-        // A redirect hint to a node we didn't know about.
-        table.note_leader(3, "http://new:8090".to_string());
+    fn leader_hints_must_match_known_membership() {
+        let table = RouteTable::new(
+            8,
+            vec!["http://a:8090".to_string(), "http://new:8090".to_string()],
+        );
+        assert_eq!(
+            table.accept_leader_hint(3, "http://new:8090/"),
+            Some("http://new:8090".to_string())
+        );
         assert_eq!(table.leader_for(3).as_deref(), Some("http://new:8090"));
-        // The learned node now participates in round-robin too.
-        let nodes: Vec<String> = (0..2).map(|_| table.any_node().unwrap()).collect();
-        assert!(nodes.contains(&"http://new:8090".to_string()));
+
+        assert_eq!(table.accept_leader_hint(3, "https://evil.example"), None);
+        assert_eq!(table.leader_for(3).as_deref(), Some("http://new:8090"));
     }
 
     #[test]
