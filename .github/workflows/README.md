@@ -6,3 +6,5 @@ GitHub Actions pipelines for the load balancer.
 - `docker.yml` — build and publish the container image on pushes to `main`.
 - `deploy-test.yml` — secret-gated deploy to the `fiducia-test` Kubernetes
   environment (requires the `KUBE_CONFIG_TEST` secret).
+- `cli-flags.yml` — audits `.cli-flags.toml` with the pinned `flags2env`
+  submodule whenever the CLI flag schema, scripts, or submodule change.

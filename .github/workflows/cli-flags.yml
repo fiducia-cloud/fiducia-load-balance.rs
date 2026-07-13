@@ -1,0 +1,31 @@
+# Audits the .cli-flags.toml schema with the pinned flags2env submodule whenever
+# the CLI flag config, scripts, or submodule change.
+name: CLI flags
+
+on:
+  pull_request:
+    paths:
+      - ".cli-flags.toml"
+      - ".gitmodules"
+      - "vendor/flags-2-env"
+      - "scripts/with-flags2env.sh"
+  push:
+    branches: [main]
+    paths:
+      - ".cli-flags.toml"
+      - ".gitmodules"
+      - "vendor/flags-2-env"
+      - "scripts/with-flags2env.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - run: vendor/flags-2-env/build/flags2env audit .cli-flags.toml
+
