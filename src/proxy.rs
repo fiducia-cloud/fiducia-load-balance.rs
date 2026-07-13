@@ -57,6 +57,10 @@ const MAX_REPLAY_BODY_BYTES: usize = 32 * 1024;
 /// OOMing the proxy. Well above `MAX_REPLAY_BODY_BYTES` so ordinary responses pass
 /// through intact; a body larger than this cannot be made idempotent.
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+/// Every upstream response is bounded, not only responses captured for
+/// idempotent replay. This prevents a chunked/missing-length node response from
+/// growing the proxy process without limit.
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const PUBLIC_SCOPES: &[&str] = &[];
 const ADMIN_READ_SCOPES: &[&str] = &["admin:read", "admin:write"];
 const ADMIN_WRITE_SCOPES: &[&str] = &["admin:write"];
@@ -134,8 +138,11 @@ enum Upstream {
     /// The node is a follower for the request's shard; retry against `leader`
     /// (from the `307 Location` / JSON hint) if it named one.
     NotLeader { leader: Option<String> },
-    /// Transport failure; try a different node.
+    /// Transport failure. Reads may try another node; writes are ambiguous and
+    /// must fail without automatic replay.
     Unreachable,
+    /// The upstream exceeded the proxy's response body ceiling.
+    ResponseTooLarge,
 }
 
 /// Entry point: resolve the target for a request and forward it.
@@ -935,17 +942,55 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
             }
             Upstream::NotLeader {
                 leader: Some(leader),
-            } => {
-                tracing::info!(shard = ?request.shard, hop, from = %request.target, to = %leader, "lb: follower redirect — retrying leader, refreshing cache");
-                request.target = redirected_leader_target(&table, request.shard, leader);
-            }
-            Upstream::NotLeader { leader: None } | Upstream::Unreachable => {
-                // No hint / dead node: pick another and retry.
-                tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: node unreachable / no leader hint — failing over to another node");
+            } => match redirected_leader_target(&table, request.shard, &leader) {
+                Some(target) => {
+                    tracing::info!(shard = ?request.shard, hop, from = %request.target, to = %target, "lb: follower redirect — retrying validated leader, refreshing cache");
+                    request.target = target;
+                }
+                None => {
+                    tracing::warn!(shard = ?request.shard, hop, from = %request.target, hinted = %leader, "lb: rejected leader hint outside known membership");
+                    match table.any_node() {
+                        Some(next) => request.target = next,
+                        None => break,
+                    }
+                }
+            },
+            Upstream::NotLeader { leader: None } => {
+                // An explicit NotLeader response means the request was not
+                // applied, so retrying another known node is safe for writes.
+                tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: follower gave no leader hint — trying another known node");
                 match table.any_node() {
                     Some(next) => request.target = next,
                     None => break,
                 }
+            }
+            Upstream::Unreachable if method_is_replay_safe(&request.method) => {
+                tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: read transport failed — failing over to another known node");
+                match table.any_node() {
+                    Some(next) => request.target = next,
+                    None => break,
+                }
+            }
+            Upstream::Unreachable => {
+                tracing::warn!(shard = ?request.shard, hop, target = %request.target, method = %request.method, "lb: mutation transport outcome is ambiguous — refusing automatic replay");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "ambiguous_upstream_result",
+                        "detail": "the mutation may have committed; retry only with the same Idempotency-Key",
+                    })),
+                )
+                    .into_response();
+            }
+            Upstream::ResponseTooLarge => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "error": "upstream_response_too_large",
+                        "detail": "the node response exceeded the load balancer limit",
+                    })),
+                )
+                    .into_response();
             }
         }
     }
@@ -957,11 +1002,20 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
         .into_response()
 }
 
-fn redirected_leader_target(table: &RouteTable, shard: Option<ShardId>, leader: String) -> String {
+fn redirected_leader_target(
+    table: &RouteTable,
+    shard: Option<ShardId>,
+    leader: &str,
+) -> Option<String> {
     if let Some(s) = shard {
-        table.note_leader(s, leader.clone());
+        table.accept_leader_hint(s, leader)
+    } else {
+        table.validate_node_hint(leader)
     }
-    leader
+}
+
+fn method_is_replay_safe(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
 /// Forward one request to one node and classify the result.
@@ -1045,7 +1099,7 @@ async fn forward_once(
         request = request.header(INTERNAL_AUTH_HEADER, secret);
     }
 
-    let Ok(response) = request.send().await else {
+    let Ok(mut response) = request.send().await else {
         return Upstream::Unreachable;
     };
     let status = StatusCode::from_u16(response.status().as_u16())
@@ -1062,11 +1116,21 @@ async fn forward_once(
             response_headers.insert(name, value);
         }
     }
-    let Ok(body) = response.bytes().await else {
-        return Upstream::Unreachable;
-    };
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk))
+                if body.len().saturating_add(chunk.len()) <= MAX_UPSTREAM_RESPONSE_BYTES =>
+            {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => return Upstream::ResponseTooLarge,
+            Ok(None) => break,
+            Err(_) => return Upstream::Unreachable,
+        }
+    }
 
-    classify_upstream_response(status, response_headers, body)
+    classify_upstream_response(status, response_headers, Bytes::from(body))
 }
 
 fn classify_upstream_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Upstream {
@@ -1338,14 +1402,40 @@ mod tests {
 
     #[test]
     fn redirect_hint_updates_route_table_before_retry() {
-        let table = RouteTable::new(16, vec!["http://old-leader:8090".to_string()]);
-        let next = redirected_leader_target(&table, Some(3), "http://new-leader:8090".to_string());
+        let table = RouteTable::new(
+            16,
+            vec![
+                "http://old-leader:8090".to_string(),
+                "http://new-leader:8090".to_string(),
+            ],
+        );
+        let next = redirected_leader_target(&table, Some(3), "http://new-leader:8090");
 
-        assert_eq!(next, "http://new-leader:8090");
+        assert_eq!(next.as_deref(), Some("http://new-leader:8090"));
         assert_eq!(
             table.leader_for(3).as_deref(),
             Some("http://new-leader:8090")
         );
+    }
+
+    #[test]
+    fn redirect_hint_outside_membership_is_rejected() {
+        let table = RouteTable::new(16, vec!["http://known:8090".to_string()]);
+        assert_eq!(
+            redirected_leader_target(&table, Some(3), "https://evil.example"),
+            None
+        );
+        assert_ne!(table.leader_for(3).as_deref(), Some("https://evil.example"));
+    }
+
+    #[test]
+    fn only_read_methods_are_safe_for_transport_failover() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(method_is_replay_safe(&method));
+        }
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!method_is_replay_safe(&method));
+        }
     }
 
     #[tokio::test]

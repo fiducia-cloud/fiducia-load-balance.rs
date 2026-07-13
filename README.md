@@ -19,11 +19,13 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
 
 - **Fast path** — cache says who leads the shard; forward straight there.
 - **Backstop** — if the cache is wrong and the request lands on a follower, the
-  node replies `NotLeader` (HTTP `307` + leader hint); the LB follows it and
-  updates the cache. Self-healing, the way etcd/TiKV clients work.
-- **No-hint fallback** — if the follower does not know the leader yet, the LB
-  round-robins another known node until a leader responds or the retry budget is
-  exhausted.
+  node replies `NotLeader` (HTTP `307` + leader hint); the LB follows it only
+  when the target is present in brain's healthy membership, then updates the
+  cache. An arbitrary redirect can never receive the trusted-hop secret.
+- **No-hint fallback** — if a follower explicitly says `NotLeader` but cannot
+  name the leader, the LB may try another known node. Transport failures are
+  retried only for reads: a mutation with a lost response is ambiguous and is
+  returned as `502 ambiguous_upstream_result`, never replayed automatically.
 
 The cache is seeded/refreshed from the control plane (`fiducia-brain`'s
 `/v1/placement`). The LB holds **no consensus state** — it's just a cache — so
@@ -68,10 +70,13 @@ customer header is consumed at the LB and is not forwarded to nodes.
 
 TLS termination can happen at this LB: set `FIDUCIA_TLS_CERT_PATH` and
 `FIDUCIA_TLS_KEY_PATH` and it will listen on `TLS_PORT` (default `8443`) with
-Rustls while continuing to serve plain HTTP on `PORT` for in-cluster health
-checks or private callers. If Cloudflare is later enabled in front of it, use
-Cloudflare in "Full (strict)" mode and point the origin at the LB HTTPS port; do
-not route Cloudflare directly to node pods.
+Rustls. When TLS is on, the plaintext `PORT` listener stays bound for k8s probes
+but **stops proxying application traffic in cleartext**: it answers `/healthz` and
+`/readyz`, and rejects every other path with `426 Upgrade Required`. It does not
+construct redirects from an untrusted `Host` header, so a credential-bearing
+mutation cannot be redirected to an attacker-controlled authority. If Cloudflare is later
+enabled in front of it, use Cloudflare in "Full (strict)" mode and point the
+origin at the LB HTTPS port; do not route Cloudflare directly to node pods.
 
 ## Two planes, two transports
 
@@ -113,36 +118,143 @@ commit.)
 
 ## Run locally
 
+Single-node dev — no auth service, no cluster secret. Scoped routes still fail
+closed (see the trust boundary below), so use a credential or hit the public
+routes when exercising the proxy:
+
 ```bash
 FIDUCIA_NODES=http://localhost:8090 FIDUCIA_SHARD_COUNT=4 cargo run   # :8088 (override PORT)
-curl 'localhost:8088/_lb/resolve?path=/v1/locks/checkout'
+curl 'localhost:8088/healthz'
+curl 'localhost:8088/_lb/resolve?path=/v1/locks/checkout'   # operator route (admin scope if authed)
 curl  localhost:8088/_lb/routes
 ```
 
-Use the pinned parser when CLI flags are more convenient than direct environment
-configuration:
+On startup with no `FIDUCIA_INTERNAL_SECRET` and no TLS paths the LB logs loud
+`WARN`s that it is running in plaintext, secret-less dev mode — expected locally,
+never in production.
+
+## Configuration surface
+
+All configuration is via environment variables (secrets are marked). Flags can be
+mapped to these vars with `flags-2-env` (see below).
+
+| Variable | Type | Default | Secret? | Meaning |
+|----------|------|---------|:-------:|---------|
+| `PORT` | integer | `8088` | no | Plain HTTP listen port (always bound). When TLS is on it serves only `/healthz` + `/readyz` and rejects everything else with `426` — no cleartext proxying or Host-derived redirect. |
+| `TLS_PORT` | integer | `8443` | no | HTTPS listen port; only used when both TLS paths are set. |
+| `FIDUCIA_SHARD_COUNT` | integer | `16` | no | Shard count; must match the data plane, or keys route to the wrong shard. |
+| `FIDUCIA_NODES` | string | *(empty)* | no | Comma-separated seed node base URLs (provisional leaders until brain refresh). |
+| `FIDUCIA_BRAIN_URL` | string | `http://localhost:8095` | no | Control-plane base URL for `shard→leader` placement refresh. |
+| `FIDUCIA_BRAIN_REFRESH_TIMEOUT_SECS` | integer | `2` | no | HTTP timeout for brain refresh calls. |
+| `FIDUCIA_INTERNAL_SECRET` | string | *(unset → off)* | **yes** | Shared trusted-hop secret. Proves an inbound request is a trusted edge hop and authenticates the LB→node/brain hop. Unset ⇒ edge-forwarded identities are **not** trusted. |
+| `FIDUCIA_INTROSPECT_SECRET` | string | *(unset)* | **yes** | Optional `x-server-auth` secret sent to `fiducia-auth` on introspection. |
+| `FIDUCIA_TLS_CERT_PATH` | string | *(unset → TLS off)* | no | PEM certificate chain served on `TLS_PORT`. Must be set together with the key. |
+| `FIDUCIA_TLS_KEY_PATH` | string | *(unset → TLS off)* | no (points at a secret) | PEM private key served on `TLS_PORT`. Must be set together with the cert. |
+| `FIDUCIA_AUTH_REQUIRED` | bool | `false` | no | When `true`, a request with **no** credential is rejected `401`. When `false`, credential-less requests are anonymous — but scoped routes still fail closed. |
+| `FIDUCIA_AUTH_ALLOW_API_KEYS` | bool | `true` | no | Accept `fdc_…` API keys (introspected via `fiducia-auth`). |
+| `FIDUCIA_AUTH_ALLOW_JWTS` | bool | `true` | no | Accept Fiducia JWTs (verified offline via JWKS). |
+| `FIDUCIA_AUTH_URL` | string | `http://fiducia-auth.fiducia.svc.cluster.local:8097` | no | Base URL for the auth service. |
+| `FIDUCIA_AUTH_INTROSPECT_URL` | string | `{auth_url}/v1/introspect` | no | Explicit introspection endpoint override. |
+| `FIDUCIA_AUTH_JWKS_URL` | string | `{auth_url}/.well-known/jwks.json` | no | JWKS endpoint for offline JWT verification. |
+| `FIDUCIA_AUTH_CACHE_TTL_SECS` | integer | `60` | no | Positive introspection cache TTL. |
+| `FIDUCIA_AUTH_NEGATIVE_CACHE_TTL_SECS` | integer | `5` | no | Negative (rejected) auth cache TTL. |
+| `FIDUCIA_AUTH_JWKS_TTL_SECS` | integer | `600` | no | JWKS cache TTL. |
+| `FIDUCIA_AUTH_JWT_CACHE_TTL_SECS` | integer | `60` | no | Max verified-JWT cache TTL (capped by token `exp`). |
+| `FIDUCIA_AUTH_HTTP_TIMEOUT_SECS` | integer | `2` | no | HTTP timeout for auth-service calls. |
+| `FIDUCIA_JWT_ISSUER` | string | `fiducia-auth` | no | Required JWT `iss`. |
+| `FIDUCIA_JWT_AUDIENCE` | string | `fiducia-api` | no | Required JWT `aud`. |
+
+## Trust boundary and security posture
+
+The LB authenticates at the boundary and **fails closed**:
+
+- **Per-route scopes fail closed.** A scoped route (any `/v1/*` mutation or admin
+  read) reached with no verified identity is rejected `403` regardless of
+  `FIDUCIA_AUTH_REQUIRED`. Only genuinely public routes (`/healthz`, `/readyz`)
+  serve anonymous callers. So even in secret-less/`AUTH_REQUIRED=false` dev mode,
+  an anonymous KV write is denied — it never reaches a node.
+- **Spoofable identity headers require the shared secret.** A trusted edge strips
+  the raw credential and forwards the verified identity in `x-fiducia-*` headers
+  plus `FIDUCIA_INTERNAL_SECRET` in `x-fiducia-edge-auth`. The LB trusts those
+  headers **only** when the secret is present and **constant-time-equal**. With no
+  secret configured (or a wrong one) the forwarded identity is dropped and the
+  request is anonymous — closing the header-spoofing bypass.
+- **Client-supplied trust headers are stripped.** `x-fiducia-*`, `authorization`,
+  `x-api-key`, `cookie`, `x-fiducia-edge-auth`, and `x-fiducia-internal-auth` are
+  never forwarded from a client to a node; the LB injects its own.
+- **Body limits.** Inbound bodies are capped at 1 MiB; idempotent-replay capture
+  is bounded (8 MiB upstream/response ceiling, 32 KiB stored, 255-byte
+  idempotency keys).
+- **Failover does not duplicate writes.** Explicit `NotLeader` responses are safe
+  to retry against another known member because the node rejected the request.
+  Network errors/timeouts on mutations are not retried: the result may have
+  committed. Clients should retry with the same `Idempotency-Key`.
+- **Leader hints are membership-bound.** Redirect targets must match the healthy
+  node set learned from configuration/brain before the LB updates its cache or
+  forwards the internal shared secret.
+- **Panics are contained.** A `CatchPanicLayer` turns any handler panic into a
+  `500` instead of dropping the connection.
+
+### TLS
+
+- TLS terminates here when **both** `FIDUCIA_TLS_CERT_PATH` and
+  `FIDUCIA_TLS_KEY_PATH` are set; setting only one is a hard startup error.
+  It listens on `TLS_PORT` with Rustls (ring provider, safe TLS 1.2/1.3 defaults;
+  no weakened cipher/version config).
+- **The plaintext `PORT` listener never proxies application traffic in cleartext
+  once TLS is on.** It stays bound (k8s liveness/readiness probes and the
+  in-cluster ClusterIP target it) but only answers `/healthz` + `/readyz`; every
+  other path gets `426 Upgrade Required`. The listener never trusts a caller's
+  `Host` header to redirect a credential-bearing request. An attacker therefore
+  cannot get a real request proxied over cleartext—or redirected to another
+  authority—even on the internal port. The guard listener carries no
+  auth/route-table state and never contacts a node. With no TLS paths set the LB
+  serves the **full proxy in plaintext only**
+  (dev) and logs a loud `WARN` at startup.
+- Cert/key files are read from disk with no explicit permission check — mount them
+  from a secret store with restrictive file modes.
+
+## flags-2-env
+
+Non-secret settings can be bridged to the `FIDUCIA_*` / `PORT` env vars above through the
+pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
+(vendored as a git submodule under `vendor/flags-2-env`). The mapping lives in
+[`.cli-flags.toml`](.cli-flags.toml) and is audited in CI (`cli-flags.yml`).
 
 ```bash
+git submodule update --init vendor/flags-2-env
 make -B -C vendor/flags-2-env all
-scripts/with-flags2env.sh --port=8088 --shard-count=4 --nodes=http://localhost:8090 -- cargo run --locked
+
+# Run the binary with flags translated into env vars:
+scripts/with-flags2env.sh --shards 4 --nodes http://localhost:8090 -- cargo run
+
+# Validate the schema:
+vendor/flags-2-env/build/flags2env audit .cli-flags.toml
 ```
 
-Shared authentication secrets remain environment-only.
+`FIDUCIA_INTERNAL_SECRET` and `FIDUCIA_INTROSPECT_SECRET` are deliberately
+excluded from the CLI schema. Inject them through the environment or a secret
+store so they cannot leak through shell history or process listings.
 
-Env:
+## Security
 
-- `PORT`, `FIDUCIA_SHARD_COUNT`, `FIDUCIA_NODES` (comma-separated node URLs),
-  `FIDUCIA_BRAIN_URL`
-- `FIDUCIA_BRAIN_REFRESH_TIMEOUT_SECS` — defaults to `2`
-- `FIDUCIA_AUTH_REQUIRED` — set `true` in production once `fiducia-auth` is
-  deployed beside the LB.
-- `FIDUCIA_AUTH_URL` — defaults to
-  `http://fiducia-auth.fiducia.svc.cluster.local:8097`.
-- `FIDUCIA_AUTH_CACHE_TTL_SECS` / `FIDUCIA_AUTH_NEGATIVE_CACHE_TTL_SECS`
-- `FIDUCIA_AUTH_JWKS_URL`, `FIDUCIA_AUTH_JWKS_TTL_SECS`,
-  `FIDUCIA_AUTH_JWT_CACHE_TTL_SECS`
-- `FIDUCIA_JWT_ISSUER` / `FIDUCIA_JWT_AUDIENCE`
-- `FIDUCIA_TLS_CERT_PATH`, `FIDUCIA_TLS_KEY_PATH`, `TLS_PORT`
+Hardening applied / verified in this crate:
+
+- Boundary auth fails closed on scoped routes; edge-forwarded identity is trusted
+  only behind a **constant-time**-verified shared secret (`src/auth.rs`).
+- Loud startup `WARN`s when running without `FIDUCIA_INTERNAL_SECRET` or without
+  TLS, so an insecure/opt-in mode is never silent (`src/main.rs`).
+- Request-body and idempotency-capture size limits; handler panics caught → `500`.
+- No `unsafe`; all `unwrap()` on the request path are over compile-time constants.
+
+Accepted / known advisories (`cargo audit` is otherwise clean):
+
+- **RUSTSEC-2025-0134 — `rustls-pemfile` unmaintained.** Pulled in transitively by
+  `axum-server`'s Rustls PEM loading. It is an *unmaintained* warning, not a known
+  vulnerability, and there is no in-semver replacement without a major upgrade of
+  the TLS stack. We deliberately **do not** force-fix or major-bump it; TLS PEM
+  parsing here only ever reads operator-provided cert/key files at startup (not
+  attacker-controlled input). Revisit when `axum-server` moves off it.
 
 ## Related
 

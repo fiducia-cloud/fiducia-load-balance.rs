@@ -110,16 +110,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8088);
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let http = serve_http(http_addr, app.clone());
+
+    // Loud, explicit warning for the opt-in trust-boundary mode: with no shared
+    // secret the LB will NOT trust edge-forwarded `x-fiducia-*` identities (they
+    // are treated as anonymous and dropped) and sends no trusted-hop secret to
+    // nodes/brain. Safe-by-default (scoped routes still fail closed), but any
+    // multi-hop / production deploy must set it.
+    if proxy::internal_secret().is_none() {
+        tracing::warn!(
+            "FIDUCIA_INTERNAL_SECRET is unset — edge-forwarded identity headers will \
+             NOT be trusted and no trusted-hop secret is sent to nodes/brain; set it \
+             for any multi-hop or production deployment"
+        );
+    }
 
     if let Some(tls) = tls_settings()? {
+        // TLS is on, so the real proxy is served over HTTPS on TLS_PORT. The
+        // plaintext PORT listener stays bound (k8s liveness/readiness probes and
+        // the in-cluster ClusterIP still target it) but must NOT proxy application
+        // traffic in cleartext: it only answers /healthz + /readyz and rejects
+        // every other path with 426. Redirecting a credential-bearing mutation
+        // using an untrusted Host header could exfiltrate its body, so the client
+        // must retry an explicitly configured HTTPS URL itself.
         let tls_addr = SocketAddr::from(([0, 0, 0, 0], tls.port));
+        tracing::info!(
+            "TLS enabled — HTTPS proxy on port {tls}; plaintext port {port} serves only \
+             /healthz + /readyz and rejects all other paths with 426 (no cleartext \
+             proxying or Host-derived redirects)",
+            tls = tls.port,
+        );
+        let guard = build_plaintext_guard_app();
+        let http = serve_http(http_addr, guard);
         let https = serve_https(tls_addr, app, tls);
         tokio::select! {
             result = http => result?,
             result = https => result?,
         }
     } else {
+        tracing::warn!(
+            "TLS is disabled (FIDUCIA_TLS_CERT_PATH / FIDUCIA_TLS_KEY_PATH unset) — \
+             serving plaintext HTTP only (full proxy on port {port}); terminate TLS here \
+             or at a trusted hop before exposing the LB to untrusted networks"
+        );
+        let http = serve_http(http_addr, app);
         http.await?;
     }
 
@@ -142,6 +175,34 @@ fn build_app(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new())
+}
+
+/// The router served on the plaintext `PORT` **when TLS is enabled**. It keeps
+/// the k8s probes answerable but refuses to proxy application traffic in
+/// cleartext: every non-probe path is answered with `426 Upgrade Required`.
+/// This carries no `AppState` — it never touches auth, the route table, an
+/// upstream node, or an untrusted Host header.
+fn build_plaintext_guard_app() -> Router {
+    Router::new()
+        // k8s liveness/readiness probes target these on the plaintext port.
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(healthz))
+        // Everything else must speak HTTPS — never proxied or redirected using
+        // caller-controlled authority data.
+        .fallback(plaintext_upgrade_required)
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
+}
+
+async fn plaintext_upgrade_required() -> Response {
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(json!({
+            "error": "https_required",
+            "detail": "cleartext proxying is disabled while TLS is enabled; retry the configured HTTPS endpoint",
+        })),
+    )
+        .into_response()
 }
 
 async fn serve_http(
@@ -359,6 +420,16 @@ mod interface_contract_tests {
         assert!(authorize_admin_read(Some(&test_identity(&["admin:write"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:*"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["*"]))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn plaintext_guard_serves_probes_but_rejects_everything_else() {
+        let resp = plaintext_upgrade_required().await;
+        assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+
+        // The guard router only registers the two probe routes as real handlers;
+        // building it must not panic.
+        let _ = build_plaintext_guard_app();
     }
 
     fn test_identity(scopes: &[&str]) -> auth::VerifiedIdentity {

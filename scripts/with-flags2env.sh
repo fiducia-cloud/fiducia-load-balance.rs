@@ -24,6 +24,8 @@ bin="${FLAGS2ENV_BIN:-}"
 if [[ -z "$bin" ]]; then
   if [[ -x "$root/vendor/flags-2-env/build/flags2env" ]]; then
     bin="$root/vendor/flags-2-env/build/flags2env"
+  elif [[ -x "$root/tools/flags-2-env/build/flags2env" ]]; then
+    bin="$root/tools/flags-2-env/build/flags2env"
   elif command -v flags2env >/dev/null 2>&1; then
     bin="$(command -v flags2env)"
   else

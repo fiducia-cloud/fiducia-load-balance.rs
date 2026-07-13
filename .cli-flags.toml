@@ -37,7 +37,7 @@ help = "TLS private-key path."
 
 [flags.shard-count]
 env = "FIDUCIA_SHARD_COUNT"
-aliases = ["shard-count"]
+aliases = ["shard-count", "shards"]
 type = "integer"
 help = "Number of logical shards."
 
