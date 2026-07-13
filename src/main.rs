@@ -112,7 +112,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let http = serve_http(http_addr, app.clone());
 
+    // Loud, explicit warning for the opt-in trust-boundary mode: with no shared
+    // secret the LB will NOT trust edge-forwarded `x-fiducia-*` identities (they
+    // are treated as anonymous and dropped) and sends no trusted-hop secret to
+    // nodes/brain. Safe-by-default (scoped routes still fail closed), but any
+    // multi-hop / production deploy must set it.
+    if proxy::internal_secret().is_none() {
+        tracing::warn!(
+            "FIDUCIA_INTERNAL_SECRET is unset — edge-forwarded identity headers will \
+             NOT be trusted and no trusted-hop secret is sent to nodes/brain; set it \
+             for any multi-hop or production deployment"
+        );
+    }
+
     if let Some(tls) = tls_settings()? {
+        // NOTE: the plaintext HTTP listener on PORT stays open alongside TLS_PORT
+        // (in-cluster health checks / private callers). It is not disabled by
+        // enabling TLS; front it with a trusted hop if plaintext must not be served.
         let tls_addr = SocketAddr::from(([0, 0, 0, 0], tls.port));
         let https = serve_https(tls_addr, app, tls);
         tokio::select! {
@@ -120,6 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             result = https => result?,
         }
     } else {
+        tracing::warn!(
+            "TLS is disabled (FIDUCIA_TLS_CERT_PATH / FIDUCIA_TLS_KEY_PATH unset) — \
+             serving plaintext HTTP only; terminate TLS here or at a trusted hop \
+             before exposing the LB to untrusted networks"
+        );
         http.await?;
     }
 

@@ -1,0 +1,57 @@
+# flags-2-env flag schema for the fiducia-load-balance binary: maps command-line
+# flags to the FIDUCIA_*/PORT env vars the load balancer reads. Consumed by
+# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-load-balance.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[flags.brain-url]
+env = "FIDUCIA_BRAIN_URL"
+aliases = ["brain-url"]
+type = "string"
+help = "Control-plane (fiducia-brain) base URL for shard→leader placement refresh."
+
+[flags.internal-secret]
+env = "FIDUCIA_INTERNAL_SECRET"
+aliases = ["internal-secret"]
+type = "string"
+help = "Shared trusted-hop secret for edge→LB and LB→node/brain auth (secret)."
+
+[flags.nodes]
+env = "FIDUCIA_NODES"
+aliases = ["nodes"]
+type = "string"
+help = "Comma-separated seed node base URLs."
+
+[flags.shards]
+env = "FIDUCIA_SHARD_COUNT"
+aliases = ["shards"]
+type = "integer"
+help = "Shard count (must match the data plane)."
+
+[flags.tls-cert-path]
+env = "FIDUCIA_TLS_CERT_PATH"
+aliases = ["tls-cert-path"]
+type = "string"
+help = "Path to the PEM TLS certificate chain served on TLS_PORT."
+
+[flags.tls-key-path]
+env = "FIDUCIA_TLS_KEY_PATH"
+aliases = ["tls-key-path"]
+type = "string"
+help = "Path to the PEM TLS private key served on TLS_PORT."
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+type = "integer"
+help = "Plain HTTP listen port."
+
+[flags.tls-port]
+env = "TLS_PORT"
+aliases = ["tls-port"]
+type = "integer"
+help = "HTTPS listen port used when TLS cert/key paths are set."
