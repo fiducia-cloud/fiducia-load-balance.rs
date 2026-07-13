@@ -230,8 +230,8 @@ async fn proxy_fallback(
     // headers. Trust that identity only when the request also carries the shared
     // internal secret proving the hop came from the edge; otherwise the request is
     // treated as anonymous and its spoofable identity headers are dropped.
-    let identity = identity
-        .or_else(|| auth::trusted_edge_identity(&headers, proxy::internal_secret()));
+    let identity =
+        identity.or_else(|| auth::trusted_edge_identity(&headers, proxy::internal_secret()));
     proxy::route(state.routes.clone(), identity, method, uri, headers, body).await
 }
 
