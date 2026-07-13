@@ -176,6 +176,85 @@ fn build_app(state: Arc<AppState>) -> Router {
         .layer(CatchPanicLayer::new())
 }
 
+/// The router served on the plaintext `PORT` **when TLS is enabled**. It keeps
+/// the k8s probes answerable but refuses to proxy application traffic in
+/// cleartext: every non-probe path is answered with a `308` redirect to the
+/// HTTPS endpoint (falling back to `426 Upgrade Required` when there is no usable
+/// `Host` to build the redirect from). This carries no `AppState` — it never
+/// touches auth, the route table, or an upstream node.
+fn build_plaintext_guard_app(tls_port: u16) -> Router {
+    Router::new()
+        // k8s liveness/readiness probes target these on the plaintext port.
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(healthz))
+        // Everything else must speak HTTPS — never proxied in cleartext.
+        .fallback(move |uri: Uri, headers: HeaderMap| async move {
+            upgrade_to_https(tls_port, uri, headers)
+        })
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
+}
+
+/// Turn a plaintext request into an HTTPS upgrade: `308` (method- and
+/// body-preserving) to the same host on the HTTPS port, or `426 Upgrade Required`
+/// when no usable `Host` header is present to redirect to.
+fn upgrade_to_https(tls_port: u16, uri: Uri, headers: HeaderMap) -> Response {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    match upgrade_location(host, tls_port, path_and_query) {
+        Some(location) => (
+            // 308 keeps the method and body intact, so a mistakenly-plaintext
+            // POST/PUT is re-sent to HTTPS rather than silently downgraded to GET.
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+            .into_response(),
+        None => (
+            StatusCode::UPGRADE_REQUIRED,
+            [(header::UPGRADE, "TLS/1.2, HTTP/1.1")],
+            Json(json!({
+                "error": "https_required",
+                "detail": "cleartext proxying is disabled while TLS is enabled; use https",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Build the `https://` `Location` for a plaintext request that must be upgraded.
+/// Preserves the request's own `Host` (swapping scheme + port), matching the
+/// standard nginx-style HTTP→HTTPS redirect. Returns `None` (→ 426) when there is
+/// no usable host to redirect to.
+fn upgrade_location(host: Option<&str>, tls_port: u16, path_and_query: &str) -> Option<String> {
+    let host = host?.trim();
+    let hostname = strip_host_port(host);
+    if hostname.is_empty() {
+        return None;
+    }
+    let authority = if tls_port == 443 {
+        hostname.to_string()
+    } else {
+        format!("{hostname}:{tls_port}")
+    };
+    Some(format!("https://{authority}{path_and_query}"))
+}
+
+/// Strip a trailing `:port` from a `Host` header value, leaving an IPv6 literal
+/// (`[::1]`) intact.
+fn strip_host_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port` — keep through the closing `]`.
+        return match host.find(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        };
+    }
+    match host.split_once(':') {
+        Some((h, _)) => h,
+        None => host,
+    }
+}
+
 async fn serve_http(
     addr: SocketAddr,
     app: Router,
