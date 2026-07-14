@@ -5,39 +5,55 @@
 //! crate, so the LB and data plane can never disagree on `key → shard`), and
 //! (elsewhere) look up that shard's leader.
 //!
-//! The key must be computed exactly as the node's `Command::routing_key` does:
+//! The key must be computed exactly as the node's `Command::routing_key` does —
+//! **including the caller's org scope**. The node namespaces every org-owned
+//! key/name into `\x01{org}\x01{key}` (`fiducia_routing::org_scoped_key`)
+//! before it reaches the state machine, so the SCOPED key is what gets hashed
+//! to a shard. Hashing the raw caller key here would pick a different, wrong
+//! shard for nearly every request and pay a NotLeader redirect each time.
 //!
 //! | Request                                  | Routing key                         |
 //! |------------------------------------------|-------------------------------------|
-//! | `GET/PUT/DELETE /v1/kv?key=K`            | `K` (query param — slash-safe)      |
+//! | `GET/PUT/DELETE /v1/kv?key=K`            | `org_scoped_key(org, K)`            |
 //! | `/v1/locks/*`, `/v1/semaphores/*`        | **`LOCK_COORDINATION_KEY`** (always — see below) |
-//! | `GET /v1/idempotency?key=K`              | `K` (query param — slash-safe)      |
-//! | `POST /v1/idempotency/{claim,complete}`  | JSON body `key`                     |
-//! | `/v1/rate-limit/{tenant}/{key}/...`      | `{key}`                             |
-//! | `/v1/cron/schedules/{name}/...`          | `{name}`                            |
-//! | `/v1/elections/{name}/...`               | `{name}`                            |
+//! | `GET /v1/idempotency?key=K`              | `org_scoped_key(org, K)`            |
+//! | `POST /v1/idempotency/{claim,complete}`  | `org_scoped_key(org, body key)`     |
+//! | `/v1/rate-limit/{tenant}/{key}/...`      | `org_scoped_key(org, key)`          |
+//! | `/v1/cron/schedules/{name}/...`          | `org_scoped_key(org, name)`         |
+//! | `/v1/elections/{name}/...`               | `org_scoped_key(org, name)`         |
 //! | `/v1/services...`                        | **`SERVICE_DISCOVERY_KEY`**         |
 //! | `/v1/kv` (no key), `/v1/status`, health  | none (any node)                     |
+//!
+//! (With no verified identity there is no org; the raw key is used, which is
+//! also what the node would 400 on — routing precision doesn't matter there.)
 //!
 //! **Locks/semaphores never route by their user key.** A multi-key *union* lock
 //! must be granted atomically and conflict-checked across every member key, which
 //! requires one state machine to see them together — so the node routes *all*
 //! lock/semaphore commands to a single coordinator shard. The LB must do the
 //! same, or a single-key acquire on `B` could land on a different shard than an
-//! active composite lock on `[A, B]` and miss the conflict.
+//! active composite lock on `[A, B]` and miss the conflict. The coordinator
+//! keys are cluster-reserved, not org-owned, so they are never org-scoped.
 
 use axum::http::Uri;
 
-// Single source of truth for `ShardId`, the hash, and coordination keys.
+// Single source of truth for `ShardId`, the hash, org scoping, and coordination keys.
+use fiducia_routing::org_scoped_key;
 #[cfg(test)]
 pub use fiducia_routing::{lock_coordination_shard, service_discovery_shard};
 pub use fiducia_routing::{shard_for, ShardId, LOCK_COORDINATION_KEY, SERVICE_DISCOVERY_KEY};
 
 /// Extract the routing key from a request, mirroring the node's API shape.
+/// `org_id` is the verified caller org (from the LB's auth layer): org-owned
+/// keys are namespaced with it exactly like the node's `OrgScope::scope`.
 ///
 /// Returns `None` for requests that don't address a single shard (health,
 /// status, and cross-shard list endpoints) — those can go to any node.
-pub fn routing_key(uri: &Uri) -> Option<String> {
+pub fn routing_key(uri: &Uri, org_id: Option<&str>) -> Option<String> {
+    let scoped = |key: String| match org_id {
+        Some(org) => org_scoped_key(org, &key),
+        None => key,
+    };
     let segs: Vec<&str> = uri
         .path()
         .trim_matches('/')
@@ -46,20 +62,20 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
         .collect();
     match segs.as_slice() {
         // KV: the key is a `?key=` query parameter (slash-safe). No key → list.
-        ["v1", "kv"] => query_param(uri, "key"),
+        ["v1", "kv"] => query_param(uri, "key").map(scoped),
         // Locks + semaphores ALWAYS route to the one lock-coordination shard,
         // regardless of the user key (atomic multi-key union needs one SM).
         ["v1", "locks", ..] | ["v1", "semaphores", ..] => Some(LOCK_COORDINATION_KEY.to_string()),
         // Idempotency inspection carries the key in the query string.
-        ["v1", "idempotency"] => query_param(uri, "key"),
+        ["v1", "idempotency"] => query_param(uri, "key").map(scoped),
         // Rate limit: /v1/rate-limit/{tenant}/{key}/... → key.
         ["v1", "rate-limit", _tenant, key, ..] | ["v1", "ratelimit", _tenant, key, ..] => {
-            Some(percent_decode(key))
+            Some(scoped(percent_decode(key)))
         }
         // Cron: /v1/cron/schedules/{name}/... → name.
-        ["v1", "cron", "schedules", name, ..] => Some(percent_decode(name)),
+        ["v1", "cron", "schedules", name, ..] => Some(scoped(percent_decode(name))),
         // Elections: /v1/elections/{name}/... → name.
-        ["v1", "elections", name, ..] => Some(percent_decode(name)),
+        ["v1", "elections", name, ..] => Some(scoped(percent_decode(name))),
         // Service discovery routes through one registry coordinator so service
         // names can be listed linearizably without cross-shard scatter-gather.
         ["v1", "services", ..] => Some(SERVICE_DISCOVERY_KEY.to_string()),
@@ -69,8 +85,8 @@ pub fn routing_key(uri: &Uri) -> Option<String> {
 }
 
 /// Extract a routing key from URI plus body for endpoints whose key is JSON-only.
-pub fn routing_key_with_body(uri: &Uri, body: &[u8]) -> Option<String> {
-    routing_key(uri).or_else(|| {
+pub fn routing_key_with_body(uri: &Uri, body: &[u8], org_id: Option<&str>) -> Option<String> {
+    routing_key(uri, org_id).or_else(|| {
         let segs: Vec<&str> = uri
             .path()
             .trim_matches('/')
@@ -79,7 +95,10 @@ pub fn routing_key_with_body(uri: &Uri, body: &[u8]) -> Option<String> {
             .collect();
         match segs.as_slice() {
             ["v1", "idempotency", "claim"] | ["v1", "idempotency", "complete"] => {
-                json_body_key(body)
+                json_body_key(body).map(|key| match org_id {
+                    Some(org) => org_scoped_key(org, &key),
+                    None => key,
+                })
             }
             _ => None,
         }
@@ -89,7 +108,7 @@ pub fn routing_key_with_body(uri: &Uri, body: &[u8]) -> Option<String> {
 /// Hash a request straight to its shard, or `None` for keyless requests.
 #[cfg(test)]
 fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
-    routing_key(uri).map(|key| shard_for(&key, shard_count))
+    routing_key(uri, None).map(|key| shard_for(&key, shard_count))
 }
 
 /// Read a query parameter, percent-decoded.
@@ -144,11 +163,68 @@ mod tests {
     fn uri(s: &str) -> Uri {
         s.parse().unwrap()
     }
+    // Anonymous (org-less) forms: exercise the raw key extraction.
     fn key(s: &str) -> Option<String> {
-        routing_key(&uri(s))
+        routing_key(&uri(s), None)
     }
     fn key_with_body(s: &str, body: &[u8]) -> Option<String> {
-        routing_key_with_body(&uri(s), body)
+        routing_key_with_body(&uri(s), body, None)
+    }
+
+    /// The verified org scopes every org-owned routing key exactly like the
+    /// node's `OrgScope::scope`, so the LB hashes the same key the node commits
+    /// under. Before this, the LB hashed the RAW key and predicted the wrong
+    /// shard for essentially every org-scoped request (a NotLeader redirect
+    /// per first touch, forever).
+    #[test]
+    fn org_owned_keys_are_scoped_with_the_callers_org() {
+        let org = Some("org_1");
+        let scoped = |k: &str| fiducia_routing::org_scoped_key("org_1", k);
+        assert_eq!(
+            routing_key(&uri("/v1/kv?key=orders/checkout"), org).as_deref(),
+            Some(scoped("orders/checkout").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/idempotency?key=req-1"), org).as_deref(),
+            Some(scoped("req-1").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/rate-limit/acme/checkout/check"), org).as_deref(),
+            Some(scoped("checkout").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/cron/schedules/nightly/history"), org).as_deref(),
+            Some(scoped("nightly").as_str()),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/elections/cleanup/campaign"), org).as_deref(),
+            Some(scoped("cleanup").as_str()),
+        );
+        assert_eq!(
+            routing_key_with_body(&uri("/v1/idempotency/claim"), br#"{"key":"req-9"}"#, org)
+                .as_deref(),
+            Some(scoped("req-9").as_str()),
+        );
+    }
+
+    /// Cluster-reserved coordinator keys are NOT org-owned: every org's lock
+    /// and discovery traffic must meet on the same shard, so the org never
+    /// touches them.
+    #[test]
+    fn coordinator_keys_are_never_org_scoped() {
+        let org = Some("org_1");
+        assert_eq!(
+            routing_key(&uri("/v1/locks/acquire"), org).as_deref(),
+            Some(LOCK_COORDINATION_KEY),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/semaphores/acquire"), org).as_deref(),
+            Some(LOCK_COORDINATION_KEY),
+        );
+        assert_eq!(
+            routing_key(&uri("/v1/services/api"), org).as_deref(),
+            Some(SERVICE_DISCOVERY_KEY),
+        );
     }
 
     #[test]

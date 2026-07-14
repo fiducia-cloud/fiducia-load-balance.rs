@@ -310,7 +310,10 @@ async fn resolve(
     }
 
     let uri: Uri = p.path.parse().unwrap_or_default();
-    let key = routing_key(&uri);
+    // Resolve under the CALLER's org scope, exactly like the proxy path: an
+    // org-owned key routes by its scoped form, so the answer shown here is the
+    // shard the data plane will really use for this identity.
+    let key = routing_key(&uri, identity.as_ref().map(|i| i.org_id.as_str()));
     let shard = key
         .as_ref()
         .map(|k| shard_for(k, state.routes.shard_count()));

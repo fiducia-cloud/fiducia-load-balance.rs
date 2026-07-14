@@ -309,7 +309,10 @@ async fn route_without_customer_idempotency(
 ) -> Response {
     // Keyed request → shard's leader. Keyless (status / list) → any node.
     // (Locks/semaphores resolve to the lock-coordination shard inside routing.)
-    let (shard, target) = match routing_key_with_body(&uri, &body) {
+    // The verified org scopes the key exactly as the node will before hashing,
+    // so the LB predicts the same shard the node actually commits on.
+    let org_id = identity.as_ref().map(|identity| identity.org_id.as_str());
+    let (shard, target) = match routing_key_with_body(&uri, &body, org_id) {
         Some(key) => {
             let shard = shard_for(&key, table.shard_count());
             (Some(shard), table.leader_for(shard))
