@@ -1229,7 +1229,24 @@ fn is_hop_by_hop(name: &str) -> bool {
 mod tests {
     use super::*;
     use axum::extract::State as AxumState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn truncated_response_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+        });
+        format!("http://{address}")
+    }
 
     #[test]
     fn classifies_node_not_leader_redirect_from_headers() {
@@ -1856,6 +1873,82 @@ mod tests {
 
         server.abort();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_mutation_transport_fails_closed_without_replaying() {
+        let ambiguous = truncated_response_upstream().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let live_hits = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            let hits = live_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::OK, "would-commit")
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let table = Arc::new(RouteTable::new(4, vec![ambiguous.clone(), live]));
+
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: ambiguous,
+                shard: Some(0),
+                method: Method::PUT,
+                uri: "/v1/kv?key=ambiguous".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(br#"{"value":"one"}"#),
+            },
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "mutation was not replayed");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_read_transport_retries_another_known_node() {
+        let ambiguous = truncated_response_upstream().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let live_hits = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            let hits = live_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::OK, "safe-read")
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let table = Arc::new(RouteTable::new(4, vec![ambiguous.clone(), live]));
+
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: ambiguous,
+                shard: Some(0),
+                method: Method::GET,
+                uri: "/v1/kv?key=ambiguous".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
     }
 
     #[test]
