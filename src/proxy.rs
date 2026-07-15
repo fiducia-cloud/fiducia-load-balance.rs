@@ -580,7 +580,19 @@ impl StoredIdempotencyResponse {
                 .into_response();
         }
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::OK);
-        let body = hex_to_bytes(&self.body_hex).unwrap_or_default();
+        // A stored body that no longer hex-decodes is corrupt: fail closed like
+        // the truncated branch above. Replaying an empty body as if it were the
+        // original response would silently hand the client wrong data.
+        let Some(body) = hex_to_bytes(&self.body_hex) else {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "idempotency_replay_unavailable",
+                    "detail": "stored response body failed to decode"
+                })),
+            )
+                .into_response();
+        };
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = status;
         if let Some(content_type) = self.content_type {
