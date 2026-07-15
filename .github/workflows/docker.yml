@@ -5,14 +5,25 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
-      packages: write
+      packages: write # Required only to publish this commit-SHA image to GHCR.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
@@ -22,9 +33,11 @@ jobs:
         with:
           context: .
           push: true
+          pull: true
+          provenance: mode=max
+          sbom: true
           build-args: |
             INTERFACES_REF=487e470c45ab5851e8f6f3b1dc048fe067fbf408
             ROUTING_REF=543b4ea3b3bba28b66c15a97a27514488d2ccce3
           tags: |
-            ghcr.io/fiducia-cloud/fiducia-load-balance:latest
             ghcr.io/fiducia-cloud/fiducia-load-balance:${{ github.sha }}
