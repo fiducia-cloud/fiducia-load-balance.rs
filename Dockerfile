@@ -5,7 +5,7 @@ FROM rust:1.97.0-slim-bookworm@sha256:cfbb0e0ef7a73e736386bfa346f1cb0503c6d16296
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
-ARG ROUTING_REF=6106b4f79a5559699a64c931dbcb472f42274266
+ARG ROUTING_REF=543b4ea3b3bba28b66c15a97a27514488d2ccce3
 ARG INTERFACES_REF=487e470c45ab5851e8f6f3b1dc048fe067fbf408
 RUN git init fiducia-routing.rs \
     && git -C fiducia-routing.rs remote add origin https://github.com/fiducia-cloud/fiducia-routing.rs.git \

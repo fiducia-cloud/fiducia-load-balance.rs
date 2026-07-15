@@ -138,9 +138,13 @@ enum Upstream {
     /// The node is a follower for the request's shard; retry against `leader`
     /// (from the `307 Location` / JSON hint) if it named one.
     NotLeader { leader: Option<String> },
-    /// Transport failure. Reads may try another node; writes are ambiguous and
-    /// must fail without automatic replay.
-    Unreachable,
+    /// Request construction or connection establishment failed before an
+    /// upstream could receive the request. Safe to retry on another node even
+    /// for a mutation.
+    NotSent,
+    /// The connection was established but the request/response failed. Reads
+    /// may try another node; mutations are ambiguous and must fail closed.
+    AmbiguousTransport,
     /// The upstream exceeded the proxy's response body ceiling.
     ResponseTooLarge,
 }
@@ -967,14 +971,21 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
                     None => break,
                 }
             }
-            Upstream::Unreachable if method_is_replay_safe(&request.method) => {
+            Upstream::NotSent => {
+                tracing::warn!(shard = ?request.shard, hop, target = %request.target, method = %request.method, "lb: upstream connection failed before send — trying another known node");
+                match table.any_node() {
+                    Some(next) => request.target = next,
+                    None => break,
+                }
+            }
+            Upstream::AmbiguousTransport if method_is_replay_safe(&request.method) => {
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: read transport failed — failing over to another known node");
                 match table.any_node() {
                     Some(next) => request.target = next,
                     None => break,
                 }
             }
-            Upstream::Unreachable => {
+            Upstream::AmbiguousTransport => {
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, method = %request.method, "lb: mutation transport outcome is ambiguous — refusing automatic replay");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -1064,10 +1075,10 @@ async fn forward_once(
     body: Bytes,
 ) -> Upstream {
     let Some(url) = upstream_url(node_url, uri) else {
-        return Upstream::Unreachable;
+        return Upstream::NotSent;
     };
     let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
-        return Upstream::Unreachable;
+        return Upstream::NotSent;
     };
 
     let client = proxy_client();
@@ -1102,8 +1113,10 @@ async fn forward_once(
         request = request.header(INTERNAL_AUTH_HEADER, secret);
     }
 
-    let Ok(mut response) = request.send().await else {
-        return Upstream::Unreachable;
+    let mut response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Upstream::NotSent,
+        Err(_) => return Upstream::AmbiguousTransport,
     };
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1129,7 +1142,7 @@ async fn forward_once(
             }
             Ok(Some(_)) => return Upstream::ResponseTooLarge,
             Ok(None) => break,
-            Err(_) => return Upstream::Unreachable,
+            Err(_) => return Upstream::AmbiguousTransport,
         }
     }
 
@@ -1804,6 +1817,39 @@ mod tests {
                 uri: "/v1/status".parse().unwrap(),
                 headers: HeaderMap::new(),
                 body: Bytes::new(),
+            },
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn retries_a_mutation_when_connection_failure_proves_it_was_not_sent() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_node = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async { (StatusCode::OK, "committed") });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let live_node = format!("http://{addr}");
+        let table = Arc::new(RouteTable::new(4, vec![dead_node.clone(), live_node]));
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: dead_node,
+                shard: Some(0),
+                method: Method::PUT,
+                uri: "/v1/kv?key=failover".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(br#"{"value":"safe"}"#),
             },
         )
         .await;
