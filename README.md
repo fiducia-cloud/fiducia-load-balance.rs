@@ -26,6 +26,9 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
   name the leader, the LB may try another known node. Transport failures are
   retried only for reads: a mutation with a lost response is ambiguous and is
   returned as `502 ambiguous_upstream_result`, never replayed automatically.
+- **Retry diversity** — one request never spends its bounded retry budget on the
+  same target twice. Stale hints and connection failures advance to an untried
+  healthy member, so a dead leader cannot prevent the third replica being tried.
 
 The cache is seeded/refreshed from the control plane (`fiducia-brain`'s
 `/v1/placement`). The LB holds **no consensus state** — it's just a cache — so
@@ -99,6 +102,7 @@ commit.)
 | `/healthz`, `/readyz` | the LB's own liveness |
 | `/_lb/routes` | dump the current `shard → leader` cache |
 | `/_lb/resolve?path=/v1/kv/foo` | show the routing decision (no forwarding) |
+| `/v1/kv?key=…&watch=true` and other SSE reads | routed to the owning shard and streamed without response buffering or a total request deadline; connect establishment remains bounded |
 | everything else | routed to the owning shard's leader |
 
 ## Layout
@@ -199,9 +203,11 @@ The LB authenticates at the boundary and **fails closed**:
 - **Client-supplied trust headers are stripped.** `x-fiducia-*`, `authorization`,
   `x-api-key`, `cookie`, `x-fiducia-edge-auth`, and `x-fiducia-internal-auth` are
   never forwarded from a client to a node; the LB injects its own.
-- **Body limits.** Inbound bodies are capped at 1 MiB; idempotent-replay capture
-  is bounded (8 MiB upstream/response ceiling, 32 KiB stored, 255-byte
-  idempotency keys).
+- **Body limits.** Inbound bodies are capped at 1 MiB; ordinary and
+  idempotent-replay responses are bounded (8 MiB upstream/response ceiling,
+  32 KiB stored, 255-byte idempotency keys). Successful `text/event-stream`
+  reads are forwarded incrementally instead of buffered; an upstream stream
+  error is logged and terminates that downstream stream.
 - **Failover does not duplicate writes.** Explicit `NotLeader` responses are safe
   to retry against another known member because the node rejected the request.
   Network errors/timeouts on mutations are not retried: the result may have

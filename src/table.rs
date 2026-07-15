@@ -9,7 +9,7 @@
 //! Stateless w.r.t. consensus — just a cache — so any number of LB instances can
 //! run behind a plain L4 balancer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
@@ -118,13 +118,26 @@ impl RouteTable {
 
     /// A node for keyless requests (status / cross-shard lists), round-robined.
     pub fn any_node(&self) -> Option<String> {
+        self.any_node_excluding(&HashSet::new())
+    }
+
+    /// Round-robin over known nodes while avoiding targets already attempted by
+    /// one proxy request. Without this, a stale leader hint can bounce the retry
+    /// loop back to the same dead member until `MAX_HOPS` is exhausted, even
+    /// though another healthy replica was never tried.
+    pub fn any_node_excluding(&self, excluded: &HashSet<String>) -> Option<String> {
         let mut inner = self.inner.write().unwrap();
         if inner.nodes.is_empty() {
             return None;
         }
-        let i = inner.cursor % inner.nodes.len();
-        inner.cursor = inner.cursor.wrapping_add(1);
-        Some(inner.nodes[i].clone())
+        for _ in 0..inner.nodes.len() {
+            let i = inner.cursor % inner.nodes.len();
+            inner.cursor = inner.cursor.wrapping_add(1);
+            if !excluded.contains(&inner.nodes[i]) {
+                return Some(inner.nodes[i].clone());
+            }
+        }
+        None
     }
 
     /// Debug view of the current routing state.
@@ -363,6 +376,30 @@ mod tests {
                 "http://c:8090",
             ],
         );
+    }
+
+    #[test]
+    fn any_node_excluding_never_revisits_attempted_members() {
+        let table = RouteTable::new(
+            8,
+            vec![
+                "http://a:8090".to_string(),
+                "http://b:8090".to_string(),
+                "http://c:8090".to_string(),
+            ],
+        );
+        let mut excluded = HashSet::from(["http://a:8090".to_string()]);
+        assert_eq!(
+            table.any_node_excluding(&excluded).as_deref(),
+            Some("http://b:8090")
+        );
+        excluded.insert("http://b:8090".to_string());
+        assert_eq!(
+            table.any_node_excluding(&excluded).as_deref(),
+            Some("http://c:8090")
+        );
+        excluded.insert("http://c:8090".to_string());
+        assert_eq!(table.any_node_excluding(&excluded), None);
     }
 
     // Same round-robin fallback, kept from origin/main for its scenario-focused

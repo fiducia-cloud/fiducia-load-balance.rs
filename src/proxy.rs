@@ -13,7 +13,10 @@
 //! The routing decision and redirect loop are both real. `NotLeader` is a
 //! self-healing cache correction, not a client-visible failure.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -21,6 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -929,7 +933,9 @@ struct ForwardRequest {
 
 /// Forward to `target`, following `NotLeader` redirects up to [`MAX_HOPS`].
 async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardRequest) -> Response {
+    let mut attempted_targets = HashSet::new();
     for hop in 0..MAX_HOPS {
+        attempted_targets.insert(request.target.clone());
         table.record_region_request(&request.target);
         match forward_once(
             &request.target,
@@ -950,13 +956,20 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
             Upstream::NotLeader {
                 leader: Some(leader),
             } => match redirected_leader_target(&table, request.shard, &leader) {
-                Some(target) => {
+                Some(target) if !attempted_targets.contains(&target) => {
                     tracing::info!(shard = ?request.shard, hop, from = %request.target, to = %target, "lb: follower redirect — retrying validated leader, refreshing cache");
                     request.target = target;
                 }
+                Some(target) => {
+                    tracing::warn!(shard = ?request.shard, hop, from = %request.target, hinted = %target, "lb: follower redirected to a target already attempted — trying an untried member");
+                    match table.any_node_excluding(&attempted_targets) {
+                        Some(next) => request.target = next,
+                        None => break,
+                    }
+                }
                 None => {
                     tracing::warn!(shard = ?request.shard, hop, from = %request.target, hinted = %leader, "lb: rejected leader hint outside known membership");
-                    match table.any_node() {
+                    match table.any_node_excluding(&attempted_targets) {
                         Some(next) => request.target = next,
                         None => break,
                     }
@@ -966,21 +979,21 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
                 // An explicit NotLeader response means the request was not
                 // applied, so retrying another known node is safe for writes.
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: follower gave no leader hint — trying another known node");
-                match table.any_node() {
+                match table.any_node_excluding(&attempted_targets) {
                     Some(next) => request.target = next,
                     None => break,
                 }
             }
             Upstream::NotSent => {
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, method = %request.method, "lb: upstream connection failed before send — trying another known node");
-                match table.any_node() {
+                match table.any_node_excluding(&attempted_targets) {
                     Some(next) => request.target = next,
                     None => break,
                 }
             }
             Upstream::AmbiguousTransport if method_is_replay_safe(&request.method) => {
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: read transport failed — failing over to another known node");
-                match table.any_node() {
+                match table.any_node_excluding(&attempted_targets) {
                     Some(next) => request.target = next,
                     None => break,
                 }
@@ -1065,6 +1078,53 @@ fn proxy_client() -> &'static reqwest::Client {
     })
 }
 
+/// Client for long-lived server streams. It keeps the same short connect
+/// timeout as ordinary forwarding, but deliberately has no total request
+/// timeout: an SSE watch is successful precisely because its response body may
+/// stay open indefinitely. `forward_once` only exposes the body as a stream
+/// after the upstream has returned a successful `text/event-stream` response;
+/// redirects and error bodies still use the ordinary bounded classifier.
+fn streaming_proxy_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn is_streaming_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+    let accepts_events = headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    let watch_query = uri.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            parts.next() == Some("watch") && parts.next() == Some("true")
+        })
+    });
+    accepts_events || watch_query
+}
+
+fn is_event_stream_response(status: StatusCode, headers: &HeaderMap) -> bool {
+    status.is_success()
+        && headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 /// LB updates its stale shard→leader cache and retries the request.
 async fn forward_once(
     node_url: &str,
@@ -1077,11 +1137,16 @@ async fn forward_once(
     let Some(url) = upstream_url(node_url, uri) else {
         return Upstream::NotSent;
     };
+    let streaming = is_streaming_request(method, uri, headers);
     let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
         return Upstream::NotSent;
     };
 
-    let client = proxy_client();
+    let client = if streaming {
+        streaming_proxy_client()
+    } else {
+        proxy_client()
+    };
     let mut request = client.request(method, url).body(body);
     for (name, value) in headers {
         if is_hop_by_hop(name.as_str())
@@ -1131,6 +1196,19 @@ async fn forward_once(
         ) {
             response_headers.insert(name, value);
         }
+    }
+    if is_event_stream_response(status, &response_headers) {
+        let upstream = node_url.to_string();
+        let stream = response.bytes_stream().map(move |item| {
+            item.map_err(|error| {
+                tracing::warn!(upstream = %upstream, error = %error, "lb: upstream event stream terminated with an error");
+                error
+            })
+        });
+        let mut downstream = Response::new(Body::from_stream(stream));
+        *downstream.status_mut() = status;
+        *downstream.headers_mut() = response_headers;
+        return Upstream::Served(downstream);
     }
     let mut body = Vec::new();
     loop {
@@ -1228,7 +1306,8 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::State as AxumState;
+    use axum::{extract::State as AxumState, routing::get, Router};
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1246,6 +1325,164 @@ mod tests {
                 .unwrap();
         });
         format!("http://{address}")
+    }
+
+    async fn event_stream_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/v1/kv",
+            get(|| async {
+                let stream = futures_util::stream::once(async {
+                    Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"event: put\ndata: {\"value\":\"on\"}\n\n",
+                    ))
+                })
+                .chain(futures_util::stream::pending());
+                let mut response = Response::new(Body::from_stream(stream));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream; charset=utf-8"),
+                );
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn spawn_test_router(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[test]
+    fn event_stream_detection_is_explicit_and_read_only() {
+        let empty = HeaderMap::new();
+        let mut accepts_sse = HeaderMap::new();
+        accepts_sse.insert(
+            "accept",
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        assert!(is_streaming_request(
+            &Method::GET,
+            &"/v1/kv?key=x&watch=true".parse().unwrap(),
+            &empty,
+        ));
+        assert!(is_streaming_request(
+            &Method::GET,
+            &"/v1/elections/x/watch".parse().unwrap(),
+            &accepts_sse,
+        ));
+        assert!(!is_streaming_request(
+            &Method::GET,
+            &"/v1/kv?key=x&watch=false".parse().unwrap(),
+            &empty,
+        ));
+        assert!(!is_streaming_request(
+            &Method::POST,
+            &"/v1/kv?key=x&watch=true".parse().unwrap(),
+            &accepts_sse,
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_event_stream_is_forwarded_without_waiting_for_eof() {
+        let (upstream, server) = event_stream_upstream().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_once(
+                &upstream,
+                None,
+                &Method::GET,
+                &"/v1/kv?key=x&watch=true".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+            ),
+        )
+        .await
+        .expect("LB must return SSE response headers without buffering its unbounded body");
+
+        let Upstream::Served(response) = result else {
+            panic!("expected a served event stream, got {result:?}");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream; charset=utf-8")
+        );
+        let mut stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("first SSE chunk must reach the downstream immediately")
+            .expect("event stream ended before its first event")
+            .expect("first event-stream chunk must be readable");
+        assert_eq!(
+            first,
+            Bytes::from_static(b"event: put\ndata: {\"value\":\"on\"}\n\n")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_loop_does_not_revisit_a_dead_stale_leader_before_trying_every_member() {
+        // Reserve then release a port to obtain a valid but unreachable member.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let stale_hint = dead.clone();
+        let redirecting = Router::new().fallback(move || {
+            let stale_hint = stale_hint.clone();
+            async move {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+                response.headers_mut().insert(
+                    "x-fiducia-leader",
+                    HeaderValue::from_str(&stale_hint).unwrap(),
+                );
+                response
+            }
+        });
+        let (follower, follower_server) = spawn_test_router(redirecting).await;
+        let healthy = Router::new().fallback(|| async {
+            (
+                StatusCode::OK,
+                Json(json!({ "served_by": "healthy-third-member" })),
+            )
+        });
+        let (healthy, healthy_server) = spawn_test_router(healthy).await;
+
+        let table = Arc::new(RouteTable::new(1, vec![dead.clone(), follower, healthy]));
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: dead,
+                shard: Some(0),
+                method: Method::GET,
+                uri: "/v1/kv?key=x".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        let (status, _headers, body) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["served_by"], "healthy-third-member");
+        follower_server.abort();
+        healthy_server.abort();
     }
 
     #[test]
