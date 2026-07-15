@@ -31,8 +31,13 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
   healthy member, so a dead leader cannot prevent the third replica being tried.
 
 The cache is seeded/refreshed from the control plane (`fiducia-brain`'s
-`/v1/placement`). The LB holds **no consensus state** — it's just a cache — so
-run as many instances as you want behind a plain L4 balancer / k8s Service.
+`/v1/placement`). Seed and brain node URLs are accepted only as credential-free
+HTTP(S) origins—never a URL with userinfo, query, fragment, or a non-root path.
+A brain refresh replaces the last-known-good table only when it contains one
+valid leader for every configured shard; a partial or malformed snapshot is
+logged and ignored instead of turning a transient control-plane read into a
+data-plane outage. The LB holds **no consensus state**—it's just a cache—so run
+as many instances as you want behind a plain L4 balancer / k8s Service.
 
 ## Edge Routing Plan
 
@@ -215,6 +220,9 @@ The LB authenticates at the boundary and **fails closed**:
 - **Leader hints are membership-bound.** Redirect targets must match the healthy
   node set learned from configuration/brain before the LB updates its cache or
   forwards the internal shared secret.
+- **Path and query decoding stay distinct.** Query `+` is form-decoded as a
+  space, while a literal `+` in a rate-limit, cron, or election path remains a
+  plus, matching Axum's extractors so the LB and node hash identical keys.
 - **Panics are contained.** A `CatchPanicLayer` turns any handler panic into a
   `500` instead of dropping the connection.
 

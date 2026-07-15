@@ -70,12 +70,12 @@ pub fn routing_key(uri: &Uri, org_id: Option<&str>) -> Option<String> {
         ["v1", "idempotency"] => query_param(uri, "key").map(scoped),
         // Rate limit: /v1/rate-limit/{tenant}/{key}/... → key.
         ["v1", "rate-limit", _tenant, key, ..] | ["v1", "ratelimit", _tenant, key, ..] => {
-            Some(scoped(percent_decode(key)))
+            Some(scoped(percent_decode_path(key)))
         }
         // Cron: /v1/cron/schedules/{name}/... → name.
-        ["v1", "cron", "schedules", name, ..] => Some(scoped(percent_decode(name))),
+        ["v1", "cron", "schedules", name, ..] => Some(scoped(percent_decode_path(name))),
         // Elections: /v1/elections/{name}/... → name.
-        ["v1", "elections", name, ..] => Some(scoped(percent_decode(name))),
+        ["v1", "elections", name, ..] => Some(scoped(percent_decode_path(name))),
         // Service discovery routes through one registry coordinator so service
         // names can be listed linearizably without cross-shard scatter-gather.
         ["v1", "services", ..] => Some(SERVICE_DISCOVERY_KEY.to_string()),
@@ -115,7 +115,7 @@ fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
 fn query_param(uri: &Uri, name: &str) -> Option<String> {
     uri.query()?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == name).then(|| percent_decode(v))
+        (k == name).then(|| percent_decode_query(v))
     })
 }
 
@@ -124,15 +124,28 @@ fn json_body_key(body: &[u8]) -> Option<String> {
     value.get("key")?.as_str().map(ToOwned::to_owned)
 }
 
-/// Minimal `application/x-www-form-urlencoded` decode (`+`→space, `%XX`→byte),
-/// matching how the node's axum `Query`/path extractors decode keys.
-fn percent_decode(s: &str) -> String {
+/// Minimal `application/x-www-form-urlencoded` query decode (`+`→space,
+/// `%XX`→byte), matching Axum's `Query` extractor.
+fn percent_decode_query(s: &str) -> String {
+    percent_decode(s, true)
+}
+
+/// Minimal URL-path segment decode (`%XX`→byte). A literal `+` stays a
+/// plus: unlike a form/query value, RFC 3986 path segments do not treat `+` as
+/// a space, and Axum's `Path` extractor preserves it. Collapsing the two decode
+/// rules makes the LB hash a different key than the node for names such as
+/// `jobs+cold`, causing an avoidable NotLeader hop (or a failed route).
+fn percent_decode_path(s: &str) -> String {
+    percent_decode(s, false)
+}
+
+fn percent_decode(s: &str, plus_as_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -285,7 +298,15 @@ mod tests {
         );
         assert_eq!(
             key("/v1/rate-limit/acme/tenant+space%2Fcheckout/check").as_deref(),
-            Some("tenant space/checkout")
+            Some("tenant+space/checkout")
+        );
+        assert_eq!(
+            key("/v1/cron/schedules/nightly+backup/history").as_deref(),
+            Some("nightly+backup")
+        );
+        assert_eq!(
+            key("/v1/elections/worker%2Bprimary/campaign").as_deref(),
+            Some("worker+primary")
         );
     }
 

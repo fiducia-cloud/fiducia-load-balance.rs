@@ -49,6 +49,18 @@ impl RouteTable {
     /// Build the table from a seed list of node URLs, provisionally assigning
     /// leaders round-robin until the first brain refresh / redirect corrects them.
     pub fn new(shard_count: u32, nodes: Vec<String>) -> Self {
+        let mut seen = HashSet::new();
+        let nodes: Vec<String> = nodes
+            .into_iter()
+            .filter_map(|node| {
+                let normalized = normalize_node_url(&node);
+                if normalized.is_none() {
+                    tracing::warn!(node = %node, "ignoring invalid load-balancer seed node URL");
+                }
+                normalized
+            })
+            .filter(|node| seen.insert(node.clone()))
+            .collect();
         let mut leaders = HashMap::new();
         if !nodes.is_empty() {
             for shard in 0..shard_count {
@@ -229,10 +241,29 @@ impl RouteTable {
             if !node.health.eq_ignore_ascii_case("healthy") {
                 continue;
             }
+            let node_id = node.node_id.trim();
+            if node_id.is_empty() {
+                tracing::warn!("rejecting brain snapshot with an empty healthy node ID");
+                return 0;
+            }
             let Some(url) = normalize_node_url(&node.address) else {
-                continue;
+                tracing::warn!(node_id, address = %node.address, "rejecting brain snapshot with an invalid healthy node URL");
+                return 0;
             };
-            node_urls_by_id.insert(node.node_id, url.clone());
+            if node_urls_by_id
+                .insert(node_id.to_string(), url.clone())
+                .is_some()
+            {
+                tracing::warn!(
+                    node_id,
+                    "rejecting brain snapshot with a duplicate healthy node ID"
+                );
+                return 0;
+            }
+            if node_metadata.contains_key(&url) {
+                tracing::warn!(node_id, %url, "rejecting brain snapshot with a duplicate healthy node URL");
+                return 0;
+            }
             node_metadata.insert(
                 url,
                 NodeMetadata {
@@ -249,6 +280,14 @@ impl RouteTable {
 
         let mut leaders = HashMap::new();
         for shard in shards {
+            if shard.shard_id >= self.shard_count {
+                tracing::warn!(
+                    shard = shard.shard_id,
+                    shard_count = self.shard_count,
+                    "rejecting brain snapshot with an out-of-range shard"
+                );
+                return 0;
+            }
             let target = shard
                 .preferred_leader
                 .as_ref()
@@ -259,12 +298,27 @@ impl RouteTable {
                         .iter()
                         .find_map(|replica| node_urls_by_id.get(replica))
                 });
-            if let Some(url) = target {
-                leaders.insert(shard.shard_id, url.clone());
+            let Some(url) = target else {
+                tracing::warn!(
+                    shard = shard.shard_id,
+                    "rejecting brain snapshot with no healthy replica for a shard"
+                );
+                return 0;
+            };
+            if leaders.insert(shard.shard_id, url.clone()).is_some() {
+                tracing::warn!(
+                    shard = shard.shard_id,
+                    "rejecting brain snapshot with a duplicate shard placement"
+                );
+                return 0;
             }
         }
-        if leaders.is_empty() {
-            tracing::warn!("brain snapshot had no shard leaders");
+        if leaders.len() != self.shard_count as usize {
+            tracing::warn!(
+                expected = self.shard_count,
+                actual = leaders.len(),
+                "rejecting partial brain snapshot; retaining last-known-good routes"
+            );
             return 0;
         }
 
@@ -341,12 +395,25 @@ struct BrainShard {
 fn normalize_node_url(address: &str) -> Option<String> {
     let address = address.trim();
     if address.is_empty() {
-        None
-    } else if address.starts_with("http://") || address.starts_with("https://") {
-        Some(address.trim_end_matches('/').to_string())
-    } else {
-        Some(format!("http://{}", address.trim_end_matches('/')))
+        return None;
     }
+    let candidate = if address.starts_with("http://") || address.starts_with("https://") {
+        address.to_string()
+    } else {
+        format!("http://{address}")
+    };
+    let parsed = reqwest::Url::parse(&candidate).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return None;
+    }
+    Some(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -466,14 +533,16 @@ mod tests {
                     cluster_id: Some("gcp-prod".to_string()),
                 },
             ],
-            vec![BrainShard {
-                shard_id: 2,
-                replicas: vec!["a".to_string(), "b".to_string()],
-                preferred_leader: Some("b".to_string()),
-            }],
+            (0..4)
+                .map(|shard_id| BrainShard {
+                    shard_id,
+                    replicas: vec!["a".to_string(), "b".to_string()],
+                    preferred_leader: Some(if shard_id == 2 { "b" } else { "a" }.to_string()),
+                })
+                .collect(),
         );
 
-        assert_eq!(applied, 1);
+        assert_eq!(applied, 4);
         assert_eq!(table.leader_for(2).as_deref(), Some("http://10.0.0.2:8090"));
         let snapshot = table.snapshot();
         assert_eq!(snapshot["node_metadata"][0]["cloud_provider"], "aws");
@@ -525,5 +594,101 @@ mod tests {
             duration_from_secs_value(Some("not-a-number"), DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS),
             Duration::from_secs(DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn seed_nodes_are_validated_normalized_and_deduplicated() {
+        let table = RouteTable::new(
+            4,
+            vec![
+                " node-a:8090/ ".to_string(),
+                "http://node-a:8090".to_string(),
+                "https://node-b:8443/".to_string(),
+                "ftp://node-c:21".to_string(),
+                "http://user:secret@node-d:8090".to_string(),
+                "http://node-e:8090/not-a-base".to_string(),
+                "http://node-f:8090?token=secret".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            table.snapshot()["nodes"],
+            json!(["http://node-a:8090", "https://node-b:8443"])
+        );
+        assert_eq!(table.leader_for(0).as_deref(), Some("http://node-a:8090"));
+        assert_eq!(table.leader_for(1).as_deref(), Some("https://node-b:8443"));
+    }
+
+    #[test]
+    fn malicious_or_non_base_leader_hints_are_rejected() {
+        let table = RouteTable::new(2, vec!["http://node-a:8090".to_string()]);
+        let original = table.leader_for(0);
+
+        for hint in [
+            "ftp://node-a:8090",
+            "http://attacker@node-a:8090",
+            "http://node-a:8090/v1/status",
+            "http://node-a:8090?redirect=attacker",
+            "http://node-a:8090#attacker",
+        ] {
+            assert_eq!(table.accept_leader_hint(0, hint), None, "hint={hint}");
+        }
+        assert_eq!(table.leader_for(0), original);
+    }
+
+    #[test]
+    fn partial_brain_snapshot_preserves_last_known_good_routes() {
+        let table = RouteTable::new(
+            3,
+            vec![
+                "http://seed-a:8090".to_string(),
+                "http://seed-b:8090".to_string(),
+            ],
+        );
+        let before = table.snapshot();
+        let applied = table.apply_brain_snapshot(
+            vec![BrainNode {
+                node_id: "brain-a".to_string(),
+                address: "brain-a:8090".to_string(),
+                health: "healthy".to_string(),
+                cloud_provider: None,
+                region: None,
+                cluster_id: None,
+            }],
+            vec![BrainShard {
+                shard_id: 0,
+                replicas: vec!["brain-a".to_string()],
+                preferred_leader: Some("brain-a".to_string()),
+            }],
+        );
+
+        assert_eq!(applied, 0);
+        assert_eq!(table.snapshot(), before);
+    }
+
+    #[test]
+    fn invalid_brain_placement_preserves_last_known_good_routes() {
+        let table = RouteTable::new(1, vec!["http://seed-a:8090".to_string()]);
+        let before = table.snapshot();
+        let node = BrainNode {
+            node_id: "brain-a".to_string(),
+            address: "brain-a:8090".to_string(),
+            health: "healthy".to_string(),
+            cloud_provider: None,
+            region: None,
+            cluster_id: None,
+        };
+
+        let applied = table.apply_brain_snapshot(
+            vec![node],
+            vec![BrainShard {
+                shard_id: 1,
+                replicas: vec!["brain-a".to_string()],
+                preferred_leader: Some("brain-a".to_string()),
+            }],
+        );
+
+        assert_eq!(applied, 0);
+        assert_eq!(table.snapshot(), before);
     }
 }
