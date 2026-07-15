@@ -309,7 +309,19 @@ async fn resolve(
         return insufficient_admin_scope_response();
     }
 
-    let uri: Uri = p.path.parse().unwrap_or_default();
+    // A malformed path must be a 400, not a silent fall-through to `Uri`'s
+    // default ("/"): answering with "/"'s shard would hand the operator a
+    // confidently wrong routing diagnosis.
+    let uri: Uri = match p.path.parse() {
+        Ok(uri) => uri,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "path is not a valid URI", "path": p.path })),
+            )
+                .into_response();
+        }
+    };
     let key = routing_key(&uri);
     let shard = key
         .as_ref()
