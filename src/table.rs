@@ -550,6 +550,58 @@ mod tests {
         assert_eq!(snapshot["node_metadata"][1]["region"], "us-central1");
     }
 
+    /// When a shard names no usable preferred leader — unset, or pointing at a
+    /// node that is not in the healthy membership — the snapshot must still
+    /// route the shard by falling back to its first HEALTHY replica, and an
+    /// unhealthy node must never become a route target at all.
+    #[test]
+    fn shard_without_a_usable_preferred_leader_falls_back_to_a_healthy_replica() {
+        let table = RouteTable::new(2, vec![]);
+        let node = |id: &str, addr: &str, health: &str| BrainNode {
+            node_id: id.to_string(),
+            address: addr.to_string(),
+            health: health.to_string(),
+            cloud_provider: None,
+            region: None,
+            cluster_id: None,
+        };
+        let applied = table.apply_brain_snapshot(
+            vec![
+                node("a", "10.0.0.1:8090", "healthy"),
+                node("b", "10.0.0.2:8090", "unhealthy"),
+                node("c", "10.0.0.3:8090", "healthy"),
+            ],
+            vec![
+                // Preferred leader "b" is unhealthy: skip it, then skip the
+                // equally-unhealthy first replica, and land on healthy "c".
+                BrainShard {
+                    shard_id: 0,
+                    replicas: vec!["b".to_string(), "c".to_string()],
+                    preferred_leader: Some("b".to_string()),
+                },
+                // No preferred leader at all: the first healthy replica leads.
+                BrainShard {
+                    shard_id: 1,
+                    replicas: vec!["a".to_string(), "c".to_string()],
+                    preferred_leader: None,
+                },
+            ],
+        );
+
+        assert_eq!(applied, 2);
+        assert_eq!(table.leader_for(0).as_deref(), Some("http://10.0.0.3:8090"));
+        assert_eq!(table.leader_for(1).as_deref(), Some("http://10.0.0.1:8090"));
+        // The unhealthy node is not routable membership: it is neither an
+        // any-node target nor an acceptable leader hint.
+        let snapshot = table.snapshot();
+        assert_eq!(
+            snapshot["nodes"],
+            json!(["http://10.0.0.1:8090", "http://10.0.0.3:8090"])
+        );
+        assert_eq!(table.accept_leader_hint(0, "http://10.0.0.2:8090"), None);
+        assert_eq!(table.leader_for(0).as_deref(), Some("http://10.0.0.3:8090"));
+    }
+
     #[test]
     fn region_requests_are_counted_by_leader_region() {
         let table = RouteTable::new(1, vec![]);

@@ -269,6 +269,43 @@ mod tests {
         );
     }
 
+    /// Org scoping must FORK the keyspace between orgs and AGREE within one:
+    /// the same caller key under two different orgs (or no org) yields
+    /// pairwise-different routing keys — one tenant can never collide into
+    /// another tenant's shard keyspace — while one org's query-path and
+    /// body-path spellings of the same key yield the identical routing key,
+    /// so a `GET /v1/kv?key=` and an idempotency body claim for that key
+    /// always chase the same shard leader.
+    #[test]
+    fn same_key_diverges_across_orgs_and_agrees_across_paths_within_one_org() {
+        let kv = uri("/v1/kv?key=orders/checkout");
+        let under_a = routing_key(&kv, Some("org_a")).unwrap();
+        let under_b = routing_key(&kv, Some("org_b")).unwrap();
+        let anonymous = routing_key(&kv, None).unwrap();
+        assert_ne!(under_a, under_b, "two orgs must never share a routing key");
+        assert_ne!(under_a, anonymous, "org-scoped must differ from unscoped");
+        assert_ne!(under_b, anonymous, "org-scoped must differ from unscoped");
+
+        // Same org, same caller key, three surfaces → one routing key.
+        let via_kv_query = routing_key(&uri("/v1/kv?key=orders/checkout"), Some("org_a")).unwrap();
+        let via_idem_query =
+            routing_key(&uri("/v1/idempotency?key=orders/checkout"), Some("org_a")).unwrap();
+        let via_idem_body = routing_key_with_body(
+            &uri("/v1/idempotency/claim"),
+            br#"{"key":"orders/checkout","ttl":"24h"}"#,
+            Some("org_a"),
+        )
+        .unwrap();
+        assert_eq!(via_kv_query, via_idem_query);
+        assert_eq!(via_kv_query, via_idem_body);
+        assert_eq!(via_kv_query, under_a);
+
+        // And equal routing keys are what guarantees an equal shard.
+        for n in [4u32, 16, 256] {
+            assert_eq!(shard_for(&via_kv_query, n), shard_for(&via_idem_body, n));
+        }
+    }
+
     #[test]
     fn kv_key_comes_from_the_query_param_and_is_slash_safe() {
         assert_eq!(key("/v1/kv?key=orders").as_deref(), Some("orders"));
