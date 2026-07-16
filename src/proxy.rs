@@ -2483,3 +2483,55 @@ mod tests {
         (status, headers, value)
     }
 }
+
+#[cfg(test)]
+mod replay_integrity_tests {
+    use axum::body::to_bytes;
+
+    use super::StoredIdempotencyResponse;
+
+    fn stored(body_hex: &str) -> StoredIdempotencyResponse {
+        StoredIdempotencyResponse {
+            fingerprint: "fp".to_string(),
+            status: 200,
+            content_type: Some("application/json".to_string()),
+            body_hex: body_hex.to_string(),
+            truncated: false,
+        }
+    }
+
+    /// A stored replay body that no longer hex-decodes is CORRUPT state. It
+    /// must fail closed (409 idempotency_replay_unavailable) exactly like the
+    /// truncated branch — replaying an empty or partial body as if it were the
+    /// original response silently hands the client wrong data.
+    #[tokio::test]
+    async fn corrupt_stored_body_fails_closed_instead_of_replaying_empty() {
+        for corrupt in ["zz", "abc", "0g"] {
+            let response = stored(corrupt).into_replay_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::CONFLICT,
+                "corrupt hex {corrupt:?} must be refused"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"], "idempotency_replay_unavailable");
+        }
+    }
+
+    /// The healthy path still replays byte-for-byte with the replay markers.
+    #[tokio::test]
+    async fn intact_stored_body_replays_verbatim() {
+        let response = stored("7b7d").into_replay_response(); // "{}"
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(super::IDEMPOTENCY_REPLAYED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"{}");
+    }
+}
