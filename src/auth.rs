@@ -426,13 +426,44 @@ struct AuthConfig {
     http_timeout: Duration,
 }
 
+/// Decide whether the LB requires authentication, given an explicit
+/// `FIDUCIA_AUTH_REQUIRED` (if any) and whether this is a debug build.
+///
+/// Secure-by-default: an unset value means **required** in release binaries (the
+/// posture any real deployment ships), while debug builds stay open so local/dev
+/// keeps working without wiring up `fiducia-auth`. An explicit value always wins
+/// in both directions — the documented escape hatch is `FIDUCIA_AUTH_REQUIRED=false`
+/// (loosen prod) or `=true` (harden a debug run). Kept pure for unit testing.
+fn auth_required_decision(explicit: Option<bool>, is_debug_build: bool) -> bool {
+    explicit.unwrap_or(!is_debug_build)
+}
+
 impl AuthConfig {
     fn from_env() -> Self {
         let auth_url = normalize_url(
             &env_value("FIDUCIA_AUTH_URL").unwrap_or_else(|| DEFAULT_AUTH_URL.to_string()),
         );
+        let explicit_required = env_bool_opt("FIDUCIA_AUTH_REQUIRED");
+        let required = auth_required_decision(explicit_required, cfg!(debug_assertions));
+        // Make the posture impossible to miss in logs at startup. `from_env` runs
+        // once, right after telemetry init, so this is effectively a boot banner.
+        if !required {
+            tracing::warn!(
+                "FIDUCIA_AUTH_REQUIRED is {} — the load balancer accepts UNAUTHENTICATED \
+                 requests; scoped routes still fail closed, but set FIDUCIA_AUTH_REQUIRED=true \
+                 before exposing this to untrusted traffic",
+                match explicit_required {
+                    Some(false) => "explicitly false",
+                    _ => "unset (defaulting off in this debug build)",
+                }
+            );
+        } else if explicit_required.is_none() {
+            tracing::info!(
+                "FIDUCIA_AUTH_REQUIRED is unset — defaulting to REQUIRED (secure) in this release build"
+            );
+        }
         AuthConfig {
-            required: env_bool("FIDUCIA_AUTH_REQUIRED", false),
+            required,
             allow_api_keys: env_bool("FIDUCIA_AUTH_ALLOW_API_KEYS", true),
             allow_jwts: env_bool("FIDUCIA_AUTH_ALLOW_JWTS", true),
             introspect_url: env_value("FIDUCIA_AUTH_INTROSPECT_URL")

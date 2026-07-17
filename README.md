@@ -26,10 +26,18 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
   name the leader, the LB may try another known node. Transport failures are
   retried only for reads: a mutation with a lost response is ambiguous and is
   returned as `502 ambiguous_upstream_result`, never replayed automatically.
+- **Retry diversity** — one request never spends its bounded retry budget on the
+  same target twice. Stale hints and connection failures advance to an untried
+  healthy member, so a dead leader cannot prevent the third replica being tried.
 
 The cache is seeded/refreshed from the control plane (`fiducia-brain`'s
-`/v1/placement`). The LB holds **no consensus state** — it's just a cache — so
-run as many instances as you want behind a plain L4 balancer / k8s Service.
+`/v1/placement`). Seed and brain node URLs are accepted only as credential-free
+HTTP(S) origins—never a URL with userinfo, query, fragment, or a non-root path.
+A brain refresh replaces the last-known-good table only when it contains one
+valid leader for every configured shard; a partial or malformed snapshot is
+logged and ignored instead of turning a transient control-plane read into a
+data-plane outage. The LB holds **no consensus state**—it's just a cache—so run
+as many instances as you want behind a plain L4 balancer / k8s Service.
 
 ## Edge Routing Plan
 
@@ -99,6 +107,7 @@ commit.)
 | `/healthz`, `/readyz` | the LB's own liveness |
 | `/_lb/routes` | dump the current `shard → leader` cache |
 | `/_lb/resolve?path=/v1/kv/foo` | show the routing decision (no forwarding) |
+| `/v1/kv?key=…&watch=true` and other SSE reads | routed to the owning shard and streamed without response buffering or a total request deadline; connect establishment remains bounded |
 | everything else | routed to the owning shard's leader |
 
 ## Layout
@@ -141,7 +150,7 @@ immutable sibling revisions for the local path dependencies:
 - `fiducia-interfaces` at
   `487e470c45ab5851e8f6f3b1dc048fe067fbf408`
 - `fiducia-routing.rs` at
-  `6106b4f79a5559699a64c931dbcb472f42274266`
+  `543b4ea3b3bba28b66c15a97a27514488d2ccce3`
 
 When either shared contract changes, update the checkout refs in
 `.github/workflows/ci.yml`, the build arguments in `.github/workflows/docker.yml`,
@@ -199,9 +208,11 @@ The LB authenticates at the boundary and **fails closed**:
 - **Client-supplied trust headers are stripped.** `x-fiducia-*`, `authorization`,
   `x-api-key`, `cookie`, `x-fiducia-edge-auth`, and `x-fiducia-internal-auth` are
   never forwarded from a client to a node; the LB injects its own.
-- **Body limits.** Inbound bodies are capped at 1 MiB; idempotent-replay capture
-  is bounded (8 MiB upstream/response ceiling, 32 KiB stored, 255-byte
-  idempotency keys).
+- **Body limits.** Inbound bodies are capped at 1 MiB; ordinary and
+  idempotent-replay responses are bounded (8 MiB upstream/response ceiling,
+  32 KiB stored, 255-byte idempotency keys). Successful `text/event-stream`
+  reads are forwarded incrementally instead of buffered; an upstream stream
+  error is logged and terminates that downstream stream.
 - **Failover does not duplicate writes.** Explicit `NotLeader` responses are safe
   to retry against another known member because the node rejected the request.
   Network errors/timeouts on mutations are not retried: the result may have
@@ -209,6 +220,9 @@ The LB authenticates at the boundary and **fails closed**:
 - **Leader hints are membership-bound.** Redirect targets must match the healthy
   node set learned from configuration/brain before the LB updates its cache or
   forwards the internal shared secret.
+- **Path and query decoding stay distinct.** Query `+` is form-decoded as a
+  space, while a literal `+` in a rate-limit, cron, or election path remains a
+  plus, matching Axum's extractors so the LB and node hash identical keys.
 - **Panics are contained.** A `CatchPanicLayer` turns any handler panic into a
   `500` instead of dropping the connection.
 

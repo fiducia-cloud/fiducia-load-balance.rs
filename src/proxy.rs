@@ -13,7 +13,10 @@
 //! The routing decision and redirect loop are both real. `NotLeader` is a
 //! self-healing cache correction, not a client-visible failure.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -21,6 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -138,9 +142,13 @@ enum Upstream {
     /// The node is a follower for the request's shard; retry against `leader`
     /// (from the `307 Location` / JSON hint) if it named one.
     NotLeader { leader: Option<String> },
-    /// Transport failure. Reads may try another node; writes are ambiguous and
-    /// must fail without automatic replay.
-    Unreachable,
+    /// Request construction or connection establishment failed before an
+    /// upstream could receive the request. Safe to retry on another node even
+    /// for a mutation.
+    NotSent,
+    /// The connection was established but the request/response failed. Reads
+    /// may try another node; mutations are ambiguous and must fail closed.
+    AmbiguousTransport,
     /// The upstream exceeded the proxy's response body ceiling.
     ResponseTooLarge,
 }
@@ -572,7 +580,19 @@ impl StoredIdempotencyResponse {
                 .into_response();
         }
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::OK);
-        let body = hex_to_bytes(&self.body_hex).unwrap_or_default();
+        // A stored body that no longer hex-decodes is corrupt: fail closed like
+        // the truncated branch above. Replaying an empty body as if it were the
+        // original response would silently hand the client wrong data.
+        let Some(body) = hex_to_bytes(&self.body_hex) else {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "idempotency_replay_unavailable",
+                    "detail": "stored response body failed to decode"
+                })),
+            )
+                .into_response();
+        };
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = status;
         if let Some(content_type) = self.content_type {
@@ -925,7 +945,9 @@ struct ForwardRequest {
 
 /// Forward to `target`, following `NotLeader` redirects up to [`MAX_HOPS`].
 async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardRequest) -> Response {
+    let mut attempted_targets = HashSet::new();
     for hop in 0..MAX_HOPS {
+        attempted_targets.insert(request.target.clone());
         table.record_region_request(&request.target);
         match forward_once(
             &request.target,
@@ -946,13 +968,20 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
             Upstream::NotLeader {
                 leader: Some(leader),
             } => match redirected_leader_target(&table, request.shard, &leader) {
-                Some(target) => {
+                Some(target) if !attempted_targets.contains(&target) => {
                     tracing::info!(shard = ?request.shard, hop, from = %request.target, to = %target, "lb: follower redirect — retrying validated leader, refreshing cache");
                     request.target = target;
                 }
+                Some(target) => {
+                    tracing::warn!(shard = ?request.shard, hop, from = %request.target, hinted = %target, "lb: follower redirected to a target already attempted — trying an untried member");
+                    match table.any_node_excluding(&attempted_targets) {
+                        Some(next) => request.target = next,
+                        None => break,
+                    }
+                }
                 None => {
                     tracing::warn!(shard = ?request.shard, hop, from = %request.target, hinted = %leader, "lb: rejected leader hint outside known membership");
-                    match table.any_node() {
+                    match table.any_node_excluding(&attempted_targets) {
                         Some(next) => request.target = next,
                         None => break,
                     }
@@ -962,19 +991,26 @@ async fn forward_with_redirect(table: Arc<RouteTable>, mut request: ForwardReque
                 // An explicit NotLeader response means the request was not
                 // applied, so retrying another known node is safe for writes.
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: follower gave no leader hint — trying another known node");
-                match table.any_node() {
+                match table.any_node_excluding(&attempted_targets) {
                     Some(next) => request.target = next,
                     None => break,
                 }
             }
-            Upstream::Unreachable if method_is_replay_safe(&request.method) => {
+            Upstream::NotSent => {
+                tracing::warn!(shard = ?request.shard, hop, target = %request.target, method = %request.method, "lb: upstream connection failed before send — trying another known node");
+                match table.any_node_excluding(&attempted_targets) {
+                    Some(next) => request.target = next,
+                    None => break,
+                }
+            }
+            Upstream::AmbiguousTransport if method_is_replay_safe(&request.method) => {
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, "lb: read transport failed — failing over to another known node");
-                match table.any_node() {
+                match table.any_node_excluding(&attempted_targets) {
                     Some(next) => request.target = next,
                     None => break,
                 }
             }
-            Upstream::Unreachable => {
+            Upstream::AmbiguousTransport => {
                 tracing::warn!(shard = ?request.shard, hop, target = %request.target, method = %request.method, "lb: mutation transport outcome is ambiguous — refusing automatic replay");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -1054,6 +1090,53 @@ fn proxy_client() -> &'static reqwest::Client {
     })
 }
 
+/// Client for long-lived server streams. It keeps the same short connect
+/// timeout as ordinary forwarding, but deliberately has no total request
+/// timeout: an SSE watch is successful precisely because its response body may
+/// stay open indefinitely. `forward_once` only exposes the body as a stream
+/// after the upstream has returned a successful `text/event-stream` response;
+/// redirects and error bodies still use the ordinary bounded classifier.
+fn streaming_proxy_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn is_streaming_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    if method != Method::GET {
+        return false;
+    }
+    let accepts_events = headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    let watch_query = uri.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            parts.next() == Some("watch") && parts.next() == Some("true")
+        })
+    });
+    accepts_events || watch_query
+}
+
+fn is_event_stream_response(status: StatusCode, headers: &HeaderMap) -> bool {
+    status.is_success()
+        && headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 /// LB updates its stale shard→leader cache and retries the request.
 async fn forward_once(
     node_url: &str,
@@ -1064,13 +1147,18 @@ async fn forward_once(
     body: Bytes,
 ) -> Upstream {
     let Some(url) = upstream_url(node_url, uri) else {
-        return Upstream::Unreachable;
+        return Upstream::NotSent;
     };
+    let streaming = is_streaming_request(method, uri, headers);
     let Ok(method) = reqwest::Method::from_bytes(method.as_str().as_bytes()) else {
-        return Upstream::Unreachable;
+        return Upstream::NotSent;
     };
 
-    let client = proxy_client();
+    let client = if streaming {
+        streaming_proxy_client()
+    } else {
+        proxy_client()
+    };
     let mut request = client.request(method, url).body(body);
     for (name, value) in headers {
         if is_hop_by_hop(name.as_str())
@@ -1102,8 +1190,10 @@ async fn forward_once(
         request = request.header(INTERNAL_AUTH_HEADER, secret);
     }
 
-    let Ok(mut response) = request.send().await else {
-        return Upstream::Unreachable;
+    let mut response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Upstream::NotSent,
+        Err(_) => return Upstream::AmbiguousTransport,
     };
     let status = StatusCode::from_u16(response.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1119,6 +1209,19 @@ async fn forward_once(
             response_headers.insert(name, value);
         }
     }
+    if is_event_stream_response(status, &response_headers) {
+        let upstream = node_url.to_string();
+        let stream = response.bytes_stream().map(move |item| {
+            item.map_err(|error| {
+                tracing::warn!(upstream = %upstream, error = %error, "lb: upstream event stream terminated with an error");
+                error
+            })
+        });
+        let mut downstream = Response::new(Body::from_stream(stream));
+        *downstream.status_mut() = status;
+        *downstream.headers_mut() = response_headers;
+        return Upstream::Served(downstream);
+    }
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
@@ -1129,7 +1232,7 @@ async fn forward_once(
             }
             Ok(Some(_)) => return Upstream::ResponseTooLarge,
             Ok(None) => break,
-            Err(_) => return Upstream::Unreachable,
+            Err(_) => return Upstream::AmbiguousTransport,
         }
     }
 
@@ -1215,8 +1318,184 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::State as AxumState;
+    use axum::{extract::State as AxumState, routing::get, Router};
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn truncated_response_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn event_stream_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/v1/kv",
+            get(|| async {
+                let stream = futures_util::stream::once(async {
+                    Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"event: put\ndata: {\"value\":\"on\"}\n\n",
+                    ))
+                })
+                .chain(futures_util::stream::pending());
+                let mut response = Response::new(Body::from_stream(stream));
+                response.headers_mut().insert(
+                    "content-type",
+                    HeaderValue::from_static("text/event-stream; charset=utf-8"),
+                );
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn spawn_test_router(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[test]
+    fn event_stream_detection_is_explicit_and_read_only() {
+        let empty = HeaderMap::new();
+        let mut accepts_sse = HeaderMap::new();
+        accepts_sse.insert(
+            "accept",
+            "application/json, text/event-stream".parse().unwrap(),
+        );
+        assert!(is_streaming_request(
+            &Method::GET,
+            &"/v1/kv?key=x&watch=true".parse().unwrap(),
+            &empty,
+        ));
+        assert!(is_streaming_request(
+            &Method::GET,
+            &"/v1/elections/x/watch".parse().unwrap(),
+            &accepts_sse,
+        ));
+        assert!(!is_streaming_request(
+            &Method::GET,
+            &"/v1/kv?key=x&watch=false".parse().unwrap(),
+            &empty,
+        ));
+        assert!(!is_streaming_request(
+            &Method::POST,
+            &"/v1/kv?key=x&watch=true".parse().unwrap(),
+            &accepts_sse,
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_event_stream_is_forwarded_without_waiting_for_eof() {
+        let (upstream, server) = event_stream_upstream().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_once(
+                &upstream,
+                None,
+                &Method::GET,
+                &"/v1/kv?key=x&watch=true".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+            ),
+        )
+        .await
+        .expect("LB must return SSE response headers without buffering its unbounded body");
+
+        let Upstream::Served(response) = result else {
+            panic!("expected a served event stream, got {result:?}");
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream; charset=utf-8")
+        );
+        let mut stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("first SSE chunk must reach the downstream immediately")
+            .expect("event stream ended before its first event")
+            .expect("first event-stream chunk must be readable");
+        assert_eq!(
+            first,
+            Bytes::from_static(b"event: put\ndata: {\"value\":\"on\"}\n\n")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_loop_does_not_revisit_a_dead_stale_leader_before_trying_every_member() {
+        // Reserve then release a port to obtain a valid but unreachable member.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let stale_hint = dead.clone();
+        let redirecting = Router::new().fallback(move || {
+            let stale_hint = stale_hint.clone();
+            async move {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+                response.headers_mut().insert(
+                    "x-fiducia-leader",
+                    HeaderValue::from_str(&stale_hint).unwrap(),
+                );
+                response
+            }
+        });
+        let (follower, follower_server) = spawn_test_router(redirecting).await;
+        let healthy = Router::new().fallback(|| async {
+            (
+                StatusCode::OK,
+                Json(json!({ "served_by": "healthy-third-member" })),
+            )
+        });
+        let (healthy, healthy_server) = spawn_test_router(healthy).await;
+
+        let table = Arc::new(RouteTable::new(1, vec![dead.clone(), follower, healthy]));
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: dead,
+                shard: Some(0),
+                method: Method::GET,
+                uri: "/v1/kv?key=x".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        )
+        .await;
+        let (status, _headers, body) = json_response(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["served_by"], "healthy-third-member");
+        follower_server.abort();
+        healthy_server.abort();
+    }
 
     #[test]
     fn classifies_node_not_leader_redirect_from_headers() {
@@ -1812,6 +2091,115 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn retries_a_mutation_when_connection_failure_proves_it_was_not_sent() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_node = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async { (StatusCode::OK, "committed") });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let live_node = format!("http://{addr}");
+        let table = Arc::new(RouteTable::new(4, vec![dead_node.clone(), live_node]));
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: dead_node,
+                shard: Some(0),
+                method: Method::PUT,
+                uri: "/v1/kv?key=failover".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(br#"{"value":"safe"}"#),
+            },
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_mutation_transport_fails_closed_without_replaying() {
+        let ambiguous = truncated_response_upstream().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let live_hits = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            let hits = live_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::OK, "would-commit")
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let table = Arc::new(RouteTable::new(4, vec![ambiguous.clone(), live]));
+
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: ambiguous,
+                shard: Some(0),
+                method: Method::PUT,
+                uri: "/v1/kv?key=ambiguous".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(br#"{"value":"one"}"#),
+            },
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "mutation was not replayed");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_read_transport_retries_another_known_node() {
+        let ambiguous = truncated_response_upstream().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let live_hits = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || {
+            let hits = live_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::OK, "safe-read")
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let table = Arc::new(RouteTable::new(4, vec![ambiguous.clone(), live]));
+
+        let response = forward_with_redirect(
+            table,
+            ForwardRequest {
+                identity: None,
+                target: ambiguous,
+                shard: Some(0),
+                method: Method::GET,
+                uri: "/v1/kv?key=ambiguous".parse().unwrap(),
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn location_header_can_supply_leader_base_url() {
         assert_eq!(
@@ -2093,5 +2481,57 @@ mod tests {
             serde_json::from_slice(&body).unwrap()
         };
         (status, headers, value)
+    }
+}
+
+#[cfg(test)]
+mod replay_integrity_tests {
+    use axum::body::to_bytes;
+
+    use super::StoredIdempotencyResponse;
+
+    fn stored(body_hex: &str) -> StoredIdempotencyResponse {
+        StoredIdempotencyResponse {
+            fingerprint: "fp".to_string(),
+            status: 200,
+            content_type: Some("application/json".to_string()),
+            body_hex: body_hex.to_string(),
+            truncated: false,
+        }
+    }
+
+    /// A stored replay body that no longer hex-decodes is CORRUPT state. It
+    /// must fail closed (409 idempotency_replay_unavailable) exactly like the
+    /// truncated branch — replaying an empty or partial body as if it were the
+    /// original response silently hands the client wrong data.
+    #[tokio::test]
+    async fn corrupt_stored_body_fails_closed_instead_of_replaying_empty() {
+        for corrupt in ["zz", "abc", "0g"] {
+            let response = stored(corrupt).into_replay_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::CONFLICT,
+                "corrupt hex {corrupt:?} must be refused"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"], "idempotency_replay_unavailable");
+        }
+    }
+
+    /// The healthy path still replays byte-for-byte with the replay markers.
+    #[tokio::test]
+    async fn intact_stored_body_replays_verbatim() {
+        let response = stored("7b7d").into_replay_response(); // "{}"
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(super::IDEMPOTENCY_REPLAYED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"{}");
     }
 }

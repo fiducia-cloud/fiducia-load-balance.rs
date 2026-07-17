@@ -1,4 +1,7 @@
-target
-.git
-.github
+target/
+.cargo-target-*/
+tmp/
+vendor/
+.git/
+.github/
 *.md

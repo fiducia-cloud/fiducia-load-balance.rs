@@ -38,9 +38,9 @@
 use axum::http::Uri;
 
 // Single source of truth for `ShardId`, the hash, org scoping, and coordination keys.
+use fiducia_routing::org_scoped_key;
 #[cfg(test)]
 pub use fiducia_routing::{lock_coordination_shard, service_discovery_shard};
-use fiducia_routing::org_scoped_key;
 pub use fiducia_routing::{shard_for, ShardId, LOCK_COORDINATION_KEY, SERVICE_DISCOVERY_KEY};
 
 /// Extract the routing key from a request, mirroring the node's API shape.
@@ -70,15 +70,29 @@ pub fn routing_key(uri: &Uri, org_id: Option<&str>) -> Option<String> {
         ["v1", "idempotency"] => query_param(uri, "key").map(scoped),
         // Rate limit: /v1/rate-limit/{tenant}/{key}/... → key.
         ["v1", "rate-limit", _tenant, key, ..] | ["v1", "ratelimit", _tenant, key, ..] => {
-            Some(scoped(percent_decode(key)))
+            Some(scoped(percent_decode_path(key)))
         }
         // Cron: /v1/cron/schedules/{name}/... → name.
-        ["v1", "cron", "schedules", name, ..] => Some(scoped(percent_decode(name))),
+        ["v1", "cron", "schedules", name, ..] => Some(scoped(percent_decode_path(name))),
         // Elections: /v1/elections/{name}/... → name.
-        ["v1", "elections", name, ..] => Some(scoped(percent_decode(name))),
+        ["v1", "elections", name, ..] => Some(scoped(percent_decode_path(name))),
         // Service discovery routes through one registry coordinator so service
         // names can be listed linearizably without cross-shard scatter-gather.
         ["v1", "services", ..] => Some(SERVICE_DISCOVERY_KEY.to_string()),
+        // Counters: `?key=` inspection (writes carry the key in the body — see
+        // `routing_key_with_body`). Org-scoped like every user key.
+        ["v1", "counters"] => query_param(uri, "key").map(scoped),
+        // Name-keyed primitives: `?name=` inspection; writes carry `name` in
+        // the body. These MUST route by that name exactly as the node's
+        // `Command::routing_key` does (org-scoped), or a read could land on a
+        // node that is not the owning shard's leader.
+        ["v1", "barriers"]
+        | ["v1", "tasks"]
+        | ["v1", "effects"]
+        | ["v1", "handoffs"]
+        | ["v1", "decisions"]
+        | ["v1", "budgets"]
+        | ["v1", "claims"] => query_param(uri, "name").map(scoped),
         // status / health / unknown → any node.
         _ => None,
     }
@@ -93,13 +107,26 @@ pub fn routing_key_with_body(uri: &Uri, body: &[u8], org_id: Option<&str>) -> Op
             .split('/')
             .filter(|s| !s.is_empty())
             .collect();
+        let scoped = |key: String| match org_id {
+            Some(org) => org_scoped_key(org, &key),
+            None => key,
+        };
         match segs.as_slice() {
             ["v1", "idempotency", "claim"] | ["v1", "idempotency", "complete"] => {
-                json_body_key(body).map(|key| match org_id {
-                    Some(org) => org_scoped_key(org, &key),
-                    None => key,
-                })
+                json_body_field(body, "key").map(scoped)
             }
+            // Counter writes carry the routing key in the JSON body.
+            ["v1", "counters", _op] => json_body_field(body, "key").map(scoped),
+            // Name-keyed primitive writes carry `name` in the JSON body; route
+            // by it exactly as the node's `Command::routing_key` does
+            // (org-scoped).
+            ["v1", "barriers", _op]
+            | ["v1", "tasks", _op]
+            | ["v1", "effects", _op]
+            | ["v1", "handoffs", _op]
+            | ["v1", "decisions", _op]
+            | ["v1", "budgets", _op]
+            | ["v1", "claims", _op] => json_body_field(body, "name").map(scoped),
             _ => None,
         }
     })
@@ -111,28 +138,43 @@ fn shard_for_request(uri: &Uri, shard_count: u32) -> Option<ShardId> {
     routing_key(uri, None).map(|key| shard_for(&key, shard_count))
 }
 
-/// Read a query parameter, percent-decoded.
+/// Read a query parameter, decoded as `application/x-www-form-urlencoded`
+/// (`+`→space) — matching how the node's axum `Query` extractor
+/// (serde_urlencoded) decodes the same parameter.
 fn query_param(uri: &Uri, name: &str) -> Option<String> {
     uri.query()?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == name).then(|| percent_decode(v))
+        (k == name).then(|| percent_decode_query(v))
     })
 }
 
-fn json_body_key(body: &[u8]) -> Option<String> {
+fn json_body_field(body: &[u8], field: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value.get("key")?.as_str().map(ToOwned::to_owned)
+    value.get(field)?.as_str().map(ToOwned::to_owned)
 }
 
-/// Minimal `application/x-www-form-urlencoded` decode (`+`→space, `%XX`→byte),
-/// matching how the node's axum `Query`/path extractors decode keys.
-fn percent_decode(s: &str) -> String {
+/// Minimal `application/x-www-form-urlencoded` query decode (`+`→space,
+/// `%XX`→byte), matching Axum's `Query` extractor.
+fn percent_decode_query(s: &str) -> String {
+    percent_decode(s, true)
+}
+
+/// Minimal URL-path segment decode (`%XX`→byte). A literal `+` stays a
+/// plus: unlike a form/query value, RFC 3986 path segments do not treat `+` as
+/// a space, and Axum's `Path` extractor preserves it. Collapsing the two decode
+/// rules makes the LB hash a different key than the node for names such as
+/// `jobs+cold`, causing an avoidable NotLeader hop (or a failed route).
+fn percent_decode_path(s: &str) -> String {
+    percent_decode(s, false)
+}
+
+fn percent_decode(s: &str, plus_as_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -227,6 +269,43 @@ mod tests {
         );
     }
 
+    /// Org scoping must FORK the keyspace between orgs and AGREE within one:
+    /// the same caller key under two different orgs (or no org) yields
+    /// pairwise-different routing keys — one tenant can never collide into
+    /// another tenant's shard keyspace — while one org's query-path and
+    /// body-path spellings of the same key yield the identical routing key,
+    /// so a `GET /v1/kv?key=` and an idempotency body claim for that key
+    /// always chase the same shard leader.
+    #[test]
+    fn same_key_diverges_across_orgs_and_agrees_across_paths_within_one_org() {
+        let kv = uri("/v1/kv?key=orders/checkout");
+        let under_a = routing_key(&kv, Some("org_a")).unwrap();
+        let under_b = routing_key(&kv, Some("org_b")).unwrap();
+        let anonymous = routing_key(&kv, None).unwrap();
+        assert_ne!(under_a, under_b, "two orgs must never share a routing key");
+        assert_ne!(under_a, anonymous, "org-scoped must differ from unscoped");
+        assert_ne!(under_b, anonymous, "org-scoped must differ from unscoped");
+
+        // Same org, same caller key, three surfaces → one routing key.
+        let via_kv_query = routing_key(&uri("/v1/kv?key=orders/checkout"), Some("org_a")).unwrap();
+        let via_idem_query =
+            routing_key(&uri("/v1/idempotency?key=orders/checkout"), Some("org_a")).unwrap();
+        let via_idem_body = routing_key_with_body(
+            &uri("/v1/idempotency/claim"),
+            br#"{"key":"orders/checkout","ttl":"24h"}"#,
+            Some("org_a"),
+        )
+        .unwrap();
+        assert_eq!(via_kv_query, via_idem_query);
+        assert_eq!(via_kv_query, via_idem_body);
+        assert_eq!(via_kv_query, under_a);
+
+        // And equal routing keys are what guarantees an equal shard.
+        for n in [4u32, 16, 256] {
+            assert_eq!(shard_for(&via_kv_query, n), shard_for(&via_idem_body, n));
+        }
+    }
+
     #[test]
     fn kv_key_comes_from_the_query_param_and_is_slash_safe() {
         assert_eq!(key("/v1/kv?key=orders").as_deref(), Some("orders"));
@@ -279,14 +358,94 @@ mod tests {
 
     #[test]
     fn routing_decodes_plus_and_percent_escapes_in_keys() {
+        // Query strings follow the form-urlencoded convention: `+` is a space
+        // (this is how the node's axum Query extractor reads the same param).
         assert_eq!(
             key("/v1/kv?key=tenant+space%2Fcheckout").as_deref(),
             Some("tenant space/checkout")
         );
+        // PATH segments do NOT use the `+`→space rule: axum's Path extractor
+        // keeps a literal `+`. The LB must match, or `a+b` hashes to a
+        // different shard here than on the node.
         assert_eq!(
             key("/v1/rate-limit/acme/tenant+space%2Fcheckout/check").as_deref(),
-            Some("tenant space/checkout")
+            Some("tenant+space/checkout")
         );
+        assert_eq!(
+            key("/v1/cron/schedules/nightly+backup/history").as_deref(),
+            Some("nightly+backup")
+        );
+        assert_eq!(
+            key("/v1/elections/worker%2Bprimary/campaign").as_deref(),
+            Some("worker+primary")
+        );
+        assert_eq!(
+            key("/v1/elections/prod%2Fjob+runner%2Fleader").as_deref(),
+            Some("prod/job+runner/leader")
+        );
+    }
+
+    #[test]
+    fn new_primitives_route_by_query_or_body_exactly_like_the_node() {
+        // Inspection: counters use `?key=`; the name-keyed primitives `?name=`.
+        assert_eq!(
+            key("/v1/counters?key=rollout%2Ffailures").as_deref(),
+            Some("rollout/failures")
+        );
+        for family in [
+            "barriers",
+            "tasks",
+            "effects",
+            "handoffs",
+            "decisions",
+            "budgets",
+            "claims",
+        ] {
+            assert_eq!(
+                key(&format!("/v1/{family}?name=release-942%2Freviewers")).as_deref(),
+                Some("release-942/reviewers"),
+                "GET /v1/{family} must route by ?name="
+            );
+        }
+
+        // Writes: the routing key rides in the JSON body (`key`/`name`),
+        // mirroring the node's Command::routing_key.
+        assert_eq!(
+            key_with_body(
+                "/v1/counters/add",
+                br#"{"key":"rollout/failures","delta":1}"#
+            )
+            .as_deref(),
+            Some("rollout/failures")
+        );
+        assert_eq!(
+            key_with_body(
+                "/v1/barriers/arrive",
+                br#"{"name":"release-942/reviewers","participant":"w1"}"#
+            )
+            .as_deref(),
+            Some("release-942/reviewers")
+        );
+        assert_eq!(
+            key_with_body(
+                "/v1/tasks/claim",
+                br#"{"name":"repo/acme/issue/482","worker":"w1"}"#
+            )
+            .as_deref(),
+            Some("repo/acme/issue/482")
+        );
+        assert_eq!(
+            key_with_body(
+                "/v1/budgets/reserve",
+                br#"{"name":"org/acme","usd_micros":5}"#
+            )
+            .as_deref(),
+            Some("org/acme")
+        );
+
+        // Keyless list/inspect without the param → any node, never a panic.
+        assert_eq!(key("/v1/counters"), None);
+        assert_eq!(key_with_body("/v1/tasks/create", b"not-json"), None);
     }
 
     #[test]
