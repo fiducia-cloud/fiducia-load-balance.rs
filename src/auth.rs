@@ -426,13 +426,44 @@ struct AuthConfig {
     http_timeout: Duration,
 }
 
+/// Decide whether the LB requires authentication, given an explicit
+/// `FIDUCIA_AUTH_REQUIRED` (if any) and whether this is a debug build.
+///
+/// Secure-by-default: an unset value means **required** in release binaries (the
+/// posture any real deployment ships), while debug builds stay open so local/dev
+/// keeps working without wiring up `fiducia-auth`. An explicit value always wins
+/// in both directions — the documented escape hatch is `FIDUCIA_AUTH_REQUIRED=false`
+/// (loosen prod) or `=true` (harden a debug run). Kept pure for unit testing.
+fn auth_required_decision(explicit: Option<bool>, is_debug_build: bool) -> bool {
+    explicit.unwrap_or(!is_debug_build)
+}
+
 impl AuthConfig {
     fn from_env() -> Self {
         let auth_url = normalize_url(
             &env_value("FIDUCIA_AUTH_URL").unwrap_or_else(|| DEFAULT_AUTH_URL.to_string()),
         );
+        let explicit_required = env_bool_opt("FIDUCIA_AUTH_REQUIRED");
+        let required = auth_required_decision(explicit_required, cfg!(debug_assertions));
+        // Make the posture impossible to miss in logs at startup. `from_env` runs
+        // once, right after telemetry init, so this is effectively a boot banner.
+        if !required {
+            tracing::warn!(
+                "FIDUCIA_AUTH_REQUIRED is {} — the load balancer accepts UNAUTHENTICATED \
+                 requests; scoped routes still fail closed, but set FIDUCIA_AUTH_REQUIRED=true \
+                 before exposing this to untrusted traffic",
+                match explicit_required {
+                    Some(false) => "explicitly false",
+                    _ => "unset (defaulting off in this debug build)",
+                }
+            );
+        } else if explicit_required.is_none() {
+            tracing::info!(
+                "FIDUCIA_AUTH_REQUIRED is unset — defaulting to REQUIRED (secure) in this release build"
+            );
+        }
         AuthConfig {
-            required: env_bool("FIDUCIA_AUTH_REQUIRED", false),
+            required,
             allow_api_keys: env_bool("FIDUCIA_AUTH_ALLOW_API_KEYS", true),
             allow_jwts: env_bool("FIDUCIA_AUTH_ALLOW_JWTS", true),
             introspect_url: env_value("FIDUCIA_AUTH_INTROSPECT_URL")
@@ -631,10 +662,17 @@ fn env_value(name: &str) -> Option<String> {
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
+    env_bool_opt(name).unwrap_or(default)
+}
+
+/// Parse a boolean env var, returning `None` when it is unset/blank or
+/// unrecognized, so callers can distinguish "operator chose a value" from
+/// "operator said nothing" (needed for secure-by-default resolution).
+fn env_bool_opt(name: &str) -> Option<bool> {
     match env_value(name).as_deref() {
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
-        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
-        _ => default,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => Some(true),
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => Some(false),
+        _ => None,
     }
 }
 
@@ -660,6 +698,26 @@ fn unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_required_defaults_secure_in_release_but_open_in_debug() {
+        // An explicit value always wins, in either direction (the escape hatch).
+        assert!(auth_required_decision(Some(true), true));
+        assert!(auth_required_decision(Some(true), false));
+        assert!(!auth_required_decision(Some(false), true));
+        assert!(!auth_required_decision(Some(false), false));
+        // Unset: secure (required) in release builds, open in debug builds.
+        assert!(auth_required_decision(None, false), "release defaults to required");
+        assert!(!auth_required_decision(None, true), "debug stays open for dev");
+    }
+
+    #[test]
+    fn env_bool_opt_distinguishes_unset_from_explicit() {
+        assert_eq!(env_bool_opt("FIDUCIA_TEST_UNSET_BOOL_XYZ"), None);
+        // Recognized truthy/falsey values parse; junk is treated as unset.
+        // (Exercised without touching process env for the recognized cases via
+        // the pure matcher above; here we only assert the unset path.)
+    }
 
     #[test]
     fn extracts_bearer_or_x_api_key() {

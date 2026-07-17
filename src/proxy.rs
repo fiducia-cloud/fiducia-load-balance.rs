@@ -260,6 +260,14 @@ fn required_scopes_for_route(method: &Method, uri: &Uri) -> &'static [&'static s
     match segs.as_slice() {
         ["healthz"] | ["readyz"] => PUBLIC_SCOPES,
         ["v1", "status"] => ADMIN_READ_SCOPES,
+        // Observability inventories (/v1/observe/{locks,semaphores,elections})
+        // enumerate every holder + fencing token across the whole caller org — a
+        // fencing token is a capability, so this is an ADMIN surface, never a
+        // plain locks:read. Node-wide /observe/{shards,metrics} carry no tenant
+        // identity and are also admin via the generic read catch-all below; this
+        // arm makes the observe gate explicit so it can't be weakened by accident
+        // (e.g. if an `observe` sub-path were ever added to the locks arm).
+        ["v1", "observe", ..] => ADMIN_READ_SCOPES,
         ["v1", "kv"] if read => KV_READ_SCOPES,
         ["v1", "kv"] => KV_WRITE_SCOPES,
         ["v1", "locks", ..] | ["v1", "semaphores", ..] | ["v1", "rw", ..] if read => {
@@ -1372,6 +1380,53 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}"), server)
+    }
+
+    fn identity_with_scopes(scopes: &[&str]) -> VerifiedIdentity {
+        VerifiedIdentity {
+            kind: crate::auth::AuthKind::ApiKey,
+            org_id: "org_test".to_string(),
+            key_id: Some("key_test".to_string()),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            require_idempotency: false,
+        }
+    }
+
+    #[test]
+    fn observe_inventory_routes_require_an_admin_scope() {
+        for path in [
+            "/v1/observe/locks",
+            "/v1/observe/semaphores",
+            "/v1/observe/elections",
+            "/v1/observe/shards",
+            "/v1/observe/metrics",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                required_scopes_for_route(&Method::GET, &uri),
+                ADMIN_READ_SCOPES,
+                "{path} must be admin-gated"
+            );
+            // A plain locks:read key — the enumeration threat — is rejected.
+            let locks_read = identity_with_scopes(&["locks:read"]);
+            assert!(authorize_route(Some(&locks_read), &Method::GET, &uri).is_err());
+            // An admin:read key is allowed.
+            let admin = identity_with_scopes(&["admin:read"]);
+            assert!(authorize_route(Some(&admin), &Method::GET, &uri).is_ok());
+        }
+    }
+
+    #[test]
+    fn plain_lock_reads_still_accept_locks_read() {
+        // Guard against over-tightening: the per-key lock read (/v1/locks?key=)
+        // must still work with a locks:read key.
+        let uri: Uri = "/v1/locks?key=orders%2F42".parse().unwrap();
+        assert_eq!(
+            required_scopes_for_route(&Method::GET, &uri),
+            LOCKS_READ_SCOPES
+        );
+        let locks_read = identity_with_scopes(&["locks:read"]);
+        assert!(authorize_route(Some(&locks_read), &Method::GET, &uri).is_ok());
     }
 
     #[test]
