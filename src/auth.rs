@@ -662,10 +662,17 @@ fn env_value(name: &str) -> Option<String> {
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
+    env_bool_opt(name).unwrap_or(default)
+}
+
+/// Parse a boolean env var, returning `None` when it is unset/blank or
+/// unrecognized, so callers can distinguish "operator chose a value" from
+/// "operator said nothing" (needed for secure-by-default resolution).
+fn env_bool_opt(name: &str) -> Option<bool> {
     match env_value(name).as_deref() {
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
-        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
-        _ => default,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => Some(true),
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => Some(false),
+        _ => None,
     }
 }
 
