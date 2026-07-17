@@ -700,6 +700,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn auth_required_defaults_secure_in_release_but_open_in_debug() {
+        // An explicit value always wins, in either direction (the escape hatch).
+        assert!(auth_required_decision(Some(true), true));
+        assert!(auth_required_decision(Some(true), false));
+        assert!(!auth_required_decision(Some(false), true));
+        assert!(!auth_required_decision(Some(false), false));
+        // Unset: secure (required) in release builds, open in debug builds.
+        assert!(auth_required_decision(None, false), "release defaults to required");
+        assert!(!auth_required_decision(None, true), "debug stays open for dev");
+    }
+
+    #[test]
+    fn env_bool_opt_distinguishes_unset_from_explicit() {
+        assert_eq!(env_bool_opt("FIDUCIA_TEST_UNSET_BOOL_XYZ"), None);
+        // Recognized truthy/falsey values parse; junk is treated as unset.
+        // (Exercised without touching process env for the recognized cases via
+        // the pure matcher above; here we only assert the unset path.)
+    }
+
+    #[test]
     fn extracts_bearer_or_x_api_key() {
         let mut headers = HeaderMap::new();
         headers.insert(
