@@ -260,6 +260,14 @@ fn required_scopes_for_route(method: &Method, uri: &Uri) -> &'static [&'static s
     match segs.as_slice() {
         ["healthz"] | ["readyz"] => PUBLIC_SCOPES,
         ["v1", "status"] => ADMIN_READ_SCOPES,
+        // Observability inventories (/v1/observe/{locks,semaphores,elections})
+        // enumerate every holder + fencing token across the whole caller org — a
+        // fencing token is a capability, so this is an ADMIN surface, never a
+        // plain locks:read. Node-wide /observe/{shards,metrics} carry no tenant
+        // identity and are also admin via the generic read catch-all below; this
+        // arm makes the observe gate explicit so it can't be weakened by accident
+        // (e.g. if an `observe` sub-path were ever added to the locks arm).
+        ["v1", "observe", ..] => ADMIN_READ_SCOPES,
         ["v1", "kv"] if read => KV_READ_SCOPES,
         ["v1", "kv"] => KV_WRITE_SCOPES,
         ["v1", "locks", ..] | ["v1", "semaphores", ..] | ["v1", "rw", ..] if read => {
