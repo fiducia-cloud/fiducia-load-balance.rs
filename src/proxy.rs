@@ -1382,6 +1382,53 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    fn identity_with_scopes(scopes: &[&str]) -> VerifiedIdentity {
+        VerifiedIdentity {
+            kind: crate::auth::AuthKind::ApiKey,
+            org_id: "org_test".to_string(),
+            key_id: Some("key_test".to_string()),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            require_idempotency: false,
+        }
+    }
+
+    #[test]
+    fn observe_inventory_routes_require_an_admin_scope() {
+        for path in [
+            "/v1/observe/locks",
+            "/v1/observe/semaphores",
+            "/v1/observe/elections",
+            "/v1/observe/shards",
+            "/v1/observe/metrics",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                required_scopes_for_route(&Method::GET, &uri),
+                ADMIN_READ_SCOPES,
+                "{path} must be admin-gated"
+            );
+            // A plain locks:read key — the enumeration threat — is rejected.
+            let locks_read = identity_with_scopes(&["locks:read"]);
+            assert!(authorize_route(Some(&locks_read), &Method::GET, &uri).is_err());
+            // An admin:read key is allowed.
+            let admin = identity_with_scopes(&["admin:read"]);
+            assert!(authorize_route(Some(&admin), &Method::GET, &uri).is_ok());
+        }
+    }
+
+    #[test]
+    fn plain_lock_reads_still_accept_locks_read() {
+        // Guard against over-tightening: the per-key lock read (/v1/locks?key=)
+        // must still work with a locks:read key.
+        let uri: Uri = "/v1/locks?key=orders%2F42".parse().unwrap();
+        assert_eq!(
+            required_scopes_for_route(&Method::GET, &uri),
+            LOCKS_READ_SCOPES
+        );
+        let locks_read = identity_with_scopes(&["locks:read"]);
+        assert!(authorize_route(Some(&locks_read), &Method::GET, &uri).is_ok());
+    }
+
     #[test]
     fn event_stream_detection_is_explicit_and_read_only() {
         let empty = HeaderMap::new();
