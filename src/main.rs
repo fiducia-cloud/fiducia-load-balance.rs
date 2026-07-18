@@ -261,23 +261,16 @@ async fn proxy_fallback(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let identity = match state.auth.authenticate(&headers).await {
+    let identity = match request_identity(&state.auth, &headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    // An edge-forwarded request carries no raw client credential (the edge strips
-    // it) and instead presents the already-verified identity in `x-fiducia-*`
-    // headers. Trust that identity only when the request also carries the shared
-    // internal secret proving the hop came from the edge; otherwise the request is
-    // treated as anonymous and its spoofable identity headers are dropped.
-    let identity =
-        identity.or_else(|| auth::trusted_edge_identity(&headers, proxy::internal_secret()));
     proxy::route(state.routes.clone(), identity, method, uri, headers, body).await
 }
 
 /// `GET /_lb/routes` — dump the current shard→leader cache.
 async fn routes_dump(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match state.auth.authenticate(&headers).await {
+    match request_identity(&state.auth, &headers).await {
         Ok(identity) => {
             if authorize_admin_read(identity.as_ref()).is_err() {
                 return insufficient_admin_scope_response();
@@ -301,7 +294,7 @@ async fn resolve(
     headers: HeaderMap,
     Query(p): Query<ResolveParams>,
 ) -> Response {
-    let identity = match state.auth.authenticate(&headers).await {
+    let identity = match request_identity(&state.auth, &headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -340,6 +333,34 @@ async fn resolve(
         "target": target,
     }))
     .into_response()
+}
+
+/// Authenticate either a raw end-client credential or an identity already
+/// verified by the trusted edge. The edge deliberately strips raw credentials,
+/// so its proof must be evaluated *before* `AuthState::authenticate`: a secure
+/// release build otherwise returns `401 missing_credentials` before it ever sees
+/// the valid `x-fiducia-edge-auth` proof.
+///
+/// A forged identity header cannot take this path: `trusted_edge_identity` only
+/// returns a value after a constant-time comparison with `FIDUCIA_INTERNAL_SECRET`.
+/// Requests without that proof retain the normal raw-credential policy, including
+/// the secure release default of requiring authentication.
+async fn request_identity(
+    auth_state: &auth::AuthState,
+    headers: &HeaderMap,
+) -> Result<Option<auth::VerifiedIdentity>, Response> {
+    request_identity_with_secret(auth_state, headers, proxy::internal_secret()).await
+}
+
+async fn request_identity_with_secret(
+    auth_state: &auth::AuthState,
+    headers: &HeaderMap,
+    expected_secret: Option<&str>,
+) -> Result<Option<auth::VerifiedIdentity>, Response> {
+    if let Some(identity) = auth::trusted_edge_identity(headers, expected_secret) {
+        return Ok(Some(identity));
+    }
+    auth_state.authenticate(headers).await
 }
 
 fn authorize_admin_read(identity: Option<&auth::VerifiedIdentity>) -> Result<(), ()> {
@@ -445,6 +466,25 @@ mod interface_contract_tests {
         assert!(authorize_admin_read(Some(&test_identity(&["admin:write"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["admin:*"]))).is_ok());
         assert!(authorize_admin_read(Some(&test_identity(&["*"]))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn valid_trusted_edge_identity_precedes_missing_raw_credentials() {
+        // Release builds require a raw bearer credential by default. A trusted
+        // edge has already authenticated the caller and intentionally strips
+        // that credential, so its valid proof must still yield an identity.
+        let auth_state = auth::AuthState::from_env();
+        let mut headers = HeaderMap::new();
+        headers.insert(auth::EDGE_AUTH_HEADER, "edge-secret".parse().unwrap());
+        headers.insert("x-fiducia-org-id", "org_edge".parse().unwrap());
+        headers.insert("x-fiducia-scopes", "kv:write".parse().unwrap());
+
+        let identity = request_identity_with_secret(&auth_state, &headers, Some("edge-secret"))
+            .await
+            .expect("valid trusted edge must not be rejected as missing credentials")
+            .expect("valid trusted edge must produce an identity");
+        assert_eq!(identity.org_id, "org_edge");
+        assert_eq!(identity.scopes, vec!["kv:write"]);
     }
 
     #[tokio::test]
