@@ -422,9 +422,11 @@ mod interface_contract_tests {
     fn generated_interfaces_are_importable() {
         let request = LockAcquireManyRequest {
             keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
-            holder: Some("worker-a".to_string()),
+            holder: "worker-a".to_string(),
+            request_id: None,
             ttl_ms: Some(30_000),
             wait: Some(false),
+            wait_timeout_ms: None,
         };
 
         assert_eq!(request.keys.len(), 2);

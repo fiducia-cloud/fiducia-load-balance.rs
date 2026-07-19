@@ -1430,6 +1430,33 @@ mod tests {
     }
 
     #[test]
+    fn coordination_renew_and_cancel_require_lock_write_scope() {
+        let locks_read = identity_with_scopes(&["locks:read"]);
+        let locks_write = identity_with_scopes(&["locks:write"]);
+        let admin_read = identity_with_scopes(&["admin:read"]);
+        let admin_write = identity_with_scopes(&["admin:write"]);
+
+        for path in [
+            "/v1/locks/renew",
+            "/v1/locks/cancel",
+            "/v1/semaphores/renew",
+            "/v1/semaphores/cancel",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                required_scopes_for_route(&Method::POST, &uri),
+                LOCKS_WRITE_SCOPES,
+                "{path} must stay a write-capability route"
+            );
+            assert!(authorize_route(None, &Method::POST, &uri).is_err());
+            assert!(authorize_route(Some(&locks_read), &Method::POST, &uri).is_err());
+            assert!(authorize_route(Some(&admin_read), &Method::POST, &uri).is_err());
+            assert!(authorize_route(Some(&locks_write), &Method::POST, &uri).is_ok());
+            assert!(authorize_route(Some(&admin_write), &Method::POST, &uri).is_ok());
+        }
+    }
+
+    #[test]
     fn event_stream_detection_is_explicit_and_read_only() {
         let empty = HeaderMap::new();
         let mut accepts_sse = HeaderMap::new();
@@ -2181,6 +2208,27 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_mutation_transport_fails_closed_without_replaying() {
+        assert_ambiguous_mutation_not_replayed(
+            Method::PUT,
+            "/v1/kv?key=ambiguous",
+            Bytes::from_static(br#"{"value":"one"}"#),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_lock_renew_transport_fails_closed_without_replaying() {
+        assert_ambiguous_mutation_not_replayed(
+            Method::POST,
+            "/v1/locks/renew",
+            Bytes::from_static(
+                br#"{"keys":["orders/42"],"holder":"worker-1","fencing_token":7,"ttl_ms":30000}"#,
+            ),
+        )
+        .await;
+    }
+
+    async fn assert_ambiguous_mutation_not_replayed(method: Method, uri: &str, body: Bytes) {
         let ambiguous = truncated_response_upstream().await;
         let hits = Arc::new(AtomicUsize::new(0));
         let live_hits = hits.clone();
@@ -2204,10 +2252,10 @@ mod tests {
                 identity: None,
                 target: ambiguous,
                 shard: Some(0),
-                method: Method::PUT,
-                uri: "/v1/kv?key=ambiguous".parse().unwrap(),
+                method,
+                uri: uri.parse().unwrap(),
                 headers: HeaderMap::new(),
-                body: Bytes::from_static(br#"{"value":"one"}"#),
+                body,
             },
         )
         .await;

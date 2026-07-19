@@ -454,9 +454,13 @@ mod tests {
         // key — so they all hash to the SAME shard (the whole point of union locks).
         let lock_paths = [
             "/v1/locks/acquire",
+            "/v1/locks/renew",
+            "/v1/locks/cancel",
             "/v1/locks/release",
             "/v1/locks?key=orders/42",
             "/v1/semaphores/acquire",
+            "/v1/semaphores/renew",
+            "/v1/semaphores/cancel",
             "/v1/semaphores/release",
             "/v1/semaphores?key=db-pool",
         ];

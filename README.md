@@ -108,6 +108,7 @@ commit.)
 | `/_lb/routes` | dump the current `shard → leader` cache |
 | `/_lb/resolve?path=/v1/kv/foo` | show the routing decision (no forwarding) |
 | `/v1/kv?key=…&watch=true` and other SSE reads | routed to the owning shard and streamed without response buffering or a total request deadline; connect establishment remains bounded |
+| `POST /v1/locks/{renew,cancel}` and `POST /v1/semaphores/{renew,cancel}` | routed to the shared lock-coordination shard; requires `locks:write` or `admin:write`, and ambiguous transport outcomes fail closed without automatic replay |
 | everything else | routed to the owning shard's leader |
 
 ## Layout
@@ -148,7 +149,7 @@ CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
 immutable sibling revisions for the local path dependencies:
 
 - `fiducia-interfaces` at
-  `487e470c45ab5851e8f6f3b1dc048fe067fbf408`
+  `6e20a3f4df2e52b99a0ad6add83d4528262b5dbc`
 - `fiducia-routing.rs` at
   `543b4ea3b3bba28b66c15a97a27514488d2ccce3`
 
