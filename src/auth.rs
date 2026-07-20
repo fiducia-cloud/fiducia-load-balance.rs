@@ -707,8 +707,14 @@ mod tests {
         assert!(!auth_required_decision(Some(false), true));
         assert!(!auth_required_decision(Some(false), false));
         // Unset: secure (required) in release builds, open in debug builds.
-        assert!(auth_required_decision(None, false), "release defaults to required");
-        assert!(!auth_required_decision(None, true), "debug stays open for dev");
+        assert!(
+            auth_required_decision(None, false),
+            "release defaults to required"
+        );
+        assert!(
+            !auth_required_decision(None, true),
+            "debug stays open for dev"
+        );
     }
 
     #[test]

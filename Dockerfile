@@ -6,7 +6,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
 ARG ROUTING_REF=543b4ea3b3bba28b66c15a97a27514488d2ccce3
-ARG INTERFACES_REF=487e470c45ab5851e8f6f3b1dc048fe067fbf408
+ARG INTERFACES_REF=6e20a3f4df2e52b99a0ad6add83d4528262b5dbc
 RUN git init fiducia-routing.rs \
     && git -C fiducia-routing.rs remote add origin https://github.com/fiducia-cloud/fiducia-routing.rs.git \
     && git -C fiducia-routing.rs fetch --depth 1 origin "$ROUTING_REF" \

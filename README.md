@@ -108,6 +108,7 @@ commit.)
 | `/_lb/routes` | dump the current `shard → leader` cache |
 | `/_lb/resolve?path=/v1/kv/foo` | show the routing decision (no forwarding) |
 | `/v1/kv?key=…&watch=true` and other SSE reads | routed to the owning shard and streamed without response buffering or a total request deadline; connect establishment remains bounded |
+| `POST /v1/locks/{renew,cancel}` and `POST /v1/semaphores/{renew,cancel}` | routed to the shared lock-coordination shard; requires `locks:write` or `admin:write`, and ambiguous transport outcomes fail closed without automatic replay |
 | everything else | routed to the owning shard's leader |
 
 ## Layout
@@ -148,7 +149,7 @@ CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
 immutable sibling revisions for the local path dependencies:
 
 - `fiducia-interfaces` at
-  `487e470c45ab5851e8f6f3b1dc048fe067fbf408`
+  `6e20a3f4df2e52b99a0ad6add83d4528262b5dbc`
 - `fiducia-routing.rs` at
   `543b4ea3b3bba28b66c15a97a27514488d2ccce3`
 
@@ -176,7 +177,7 @@ mapped to these vars with `flags-2-env` (see below).
 | `FIDUCIA_INTROSPECT_SECRET` | string | *(unset)* | **yes** | Optional `x-server-auth` secret sent to `fiducia-auth` on introspection. |
 | `FIDUCIA_TLS_CERT_PATH` | string | *(unset → TLS off)* | no | PEM certificate chain served on `TLS_PORT`. Must be set together with the key. |
 | `FIDUCIA_TLS_KEY_PATH` | string | *(unset → TLS off)* | no (points at a secret) | PEM private key served on `TLS_PORT`. Must be set together with the cert. |
-| `FIDUCIA_AUTH_REQUIRED` | bool | `false` | no | When `true`, a request with **no** credential is rejected `401`. When `false`, credential-less requests are anonymous — but scoped routes still fail closed. |
+| `FIDUCIA_AUTH_REQUIRED` | bool | `true` in release; `false` in debug | no | When `true`, a request with **no** raw credential or valid trusted-edge proof is rejected `401`. When `false`, credential-less requests are anonymous — but scoped routes still fail closed. |
 | `FIDUCIA_AUTH_ALLOW_API_KEYS` | bool | `true` | no | Accept `fdc_…` API keys (introspected via `fiducia-auth`). |
 | `FIDUCIA_AUTH_ALLOW_JWTS` | bool | `true` | no | Accept Fiducia JWTs (verified offline via JWKS). |
 | `FIDUCIA_AUTH_URL` | string | `http://fiducia-auth.fiducia.svc.cluster.local:8097` | no | Base URL for the auth service. |
@@ -194,11 +195,12 @@ mapped to these vars with `flags-2-env` (see below).
 
 The LB authenticates at the boundary and **fails closed**:
 
-- **Per-route scopes fail closed.** A scoped route (any `/v1/*` mutation or admin
-  read) reached with no verified identity is rejected `403` regardless of
-  `FIDUCIA_AUTH_REQUIRED`. Only genuinely public routes (`/healthz`, `/readyz`)
-  serve anonymous callers. So even in secret-less/`AUTH_REQUIRED=false` dev mode,
-  an anonymous KV write is denied — it never reaches a node.
+- **Authentication and scopes fail closed.** With `FIDUCIA_AUTH_REQUIRED=true`
+  (the release default), a request with no raw credential or valid trusted-edge
+  proof is rejected `401`. With `AUTH_REQUIRED=false`, that request is anonymous;
+  a scoped route (any `/v1/*` mutation or admin read) then rejects it `403`.
+  Only genuinely public routes (`/healthz`, `/readyz`) serve anonymous callers,
+  so an anonymous KV write never reaches a node in either mode.
 - **Spoofable identity headers require the shared secret.** A trusted edge strips
   the raw credential and forwards the verified identity in `x-fiducia-*` headers
   plus `FIDUCIA_INTERNAL_SECRET` in `x-fiducia-edge-auth`. The LB trusts those
