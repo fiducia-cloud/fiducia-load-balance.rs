@@ -104,7 +104,8 @@ commit.)
 
 | Route | Purpose |
 |-------|---------|
-| `/healthz`, `/readyz` | the LB's own liveness |
+| `/healthz` | the LB's own liveness |
+| `/readyz` | readiness: `503` until the `shard → leader` table is hydrated, so a fresh pod doesn't join the Service and answer `no_route` |
 | `/_lb/routes` | dump the current `shard → leader` cache |
 | `/_lb/resolve?path=/v1/kv/foo` | show the routing decision (no forwarding) |
 | `/v1/kv?key=…&watch=true` and other SSE reads | routed to the owning shard and streamed without response buffering or a total request deadline; connect establishment remains bounded |

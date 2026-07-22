@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,6 +27,10 @@ struct Inner {
     node_metadata: HashMap<String, NodeMetadata>,
     /// Best-known leader per shard. May be stale; corrected on redirect.
     leaders: HashMap<ShardId, String>,
+    /// When a shard's leader was last learned from a node's `NotLeader` redirect.
+    /// A redirect is fresher than the 5s brain snapshot, so it wins over one that
+    /// was already in flight when the redirect arrived.
+    leader_hints: HashMap<ShardId, Instant>,
     /// Best-effort routed request counts by leader region.
     region_requests: HashMap<String, u64>,
     /// Round-robin cursor for keyless ("any node") requests.
@@ -73,6 +77,7 @@ impl RouteTable {
                 nodes,
                 node_metadata: HashMap::new(),
                 leaders,
+                leader_hints: HashMap::new(),
                 region_requests: HashMap::new(),
                 cursor: 0,
             }),
@@ -81,6 +86,13 @@ impl RouteTable {
 
     pub fn shard_count(&self) -> u32 {
         self.shard_count
+    }
+
+    /// Is the route table hydrated — i.e. does the LB know a leader for at least
+    /// one shard? A pod with an empty map can only answer `503 no_route`, so
+    /// readiness must be false until this is true (see `/readyz` in `main.rs`).
+    pub fn is_hydrated(&self) -> bool {
+        !self.inner.read().unwrap().leaders.is_empty()
     }
 
     /// Best-known leader URL for a shard, if any node is known for it.
@@ -99,6 +111,7 @@ impl RouteTable {
             (normalize_node_url(node).as_deref() == Some(&normalized)).then(|| node.clone())
         })?;
         inner.leaders.insert(shard, known.clone());
+        inner.leader_hints.insert(shard, Instant::now());
         Some(known)
     }
 
@@ -185,6 +198,9 @@ impl RouteTable {
 
     /// Refresh the shard map from the control plane.
     pub async fn refresh_from_brain(&self, brain_url: &str) {
+        // Stamped before the fetch: anything learned from a redirect after this
+        // point is newer than the snapshot we are about to apply.
+        let fetched_at = Instant::now();
         let base = brain_url.trim_end_matches('/');
         let client = brain_client();
         // The brain's /v1 enforces the trusted-hop secret when configured.
@@ -226,7 +242,7 @@ impl RouteTable {
                 return;
             }
         };
-        let applied = self.apply_brain_snapshot(nodes.nodes, placement.shards);
+        let applied = self.apply_brain_snapshot_at(nodes.nodes, placement.shards, fetched_at);
         tracing::info!(
             metric.name = "fiducia.lb.brain_refresh",
             leaders = applied,
@@ -234,7 +250,19 @@ impl RouteTable {
         );
     }
 
+    #[cfg(test)]
     fn apply_brain_snapshot(&self, nodes: Vec<BrainNode>, shards: Vec<BrainShard>) -> usize {
+        self.apply_brain_snapshot_at(nodes, shards, Instant::now())
+    }
+
+    /// `fetched_at` is when the snapshot was *requested*, so a leader learned from
+    /// a `NotLeader` redirect while it was in flight is known to be newer.
+    fn apply_brain_snapshot_at(
+        &self,
+        nodes: Vec<BrainNode>,
+        shards: Vec<BrainShard>,
+        fetched_at: Instant,
+    ) -> usize {
         let mut node_urls_by_id = HashMap::new();
         let mut node_metadata = HashMap::new();
         for node in nodes {
@@ -246,9 +274,13 @@ impl RouteTable {
                 tracing::warn!("rejecting brain snapshot with an empty healthy node ID");
                 return 0;
             }
+            // One node with a malformed address (an empty heartbeat address is the
+            // common case) must not discard the whole cluster's routes: skip that
+            // node and apply the rest. A shard that has no other healthy replica
+            // still rejects the snapshot below, so this only loses what it must.
             let Some(url) = normalize_node_url(&node.address) else {
-                tracing::warn!(node_id, address = %node.address, "rejecting brain snapshot with an invalid healthy node URL");
-                return 0;
+                tracing::warn!(node_id, address = %node.address, "skipping healthy brain node with an invalid URL");
+                continue;
             };
             if node_urls_by_id
                 .insert(node_id.to_string(), url.clone())
@@ -326,6 +358,22 @@ impl RouteTable {
         nodes.sort();
         let applied = leaders.len();
         let mut inner = self.inner.write().unwrap();
+        // A leader learned from a `NotLeader` redirect *after* this snapshot was
+        // requested is fresher than the snapshot — the node itself told us. Keep it
+        // (as long as it is still healthy membership) instead of overwriting it
+        // every 5s with a placement the cluster has already moved past. Hints older
+        // than the snapshot are superseded and dropped.
+        inner
+            .leader_hints
+            .retain(|_, learned_at| *learned_at >= fetched_at);
+        for (shard, hinted) in &inner.leader_hints {
+            if let Some(current) = inner.leaders.get(shard) {
+                if nodes.contains(current) {
+                    leaders.insert(*shard, current.clone());
+                    tracing::debug!(shard, leader = %current, hint_age_ms = hinted.elapsed().as_millis() as u64, "keeping redirect-learned leader over brain snapshot");
+                }
+            }
+        }
         inner.nodes = nodes;
         inner.node_metadata = node_metadata;
         inner.leaders = leaders;
@@ -742,5 +790,130 @@ mod tests {
 
         assert_eq!(applied, 0);
         assert_eq!(table.snapshot(), before);
+    }
+
+    /// A node whose heartbeat carries an unusable address must cost only itself:
+    /// discarding the whole snapshot dropped every shard's route cluster-wide,
+    /// every 5s, for one malformed member.
+    #[test]
+    fn one_malformed_node_address_does_not_discard_the_whole_snapshot() {
+        let table = RouteTable::new(2, vec![]);
+        let node = |id: &str, addr: &str| BrainNode {
+            node_id: id.to_string(),
+            address: addr.to_string(),
+            health: "healthy".to_string(),
+            cloud_provider: None,
+            region: None,
+            cluster_id: None,
+        };
+        let applied = table.apply_brain_snapshot(
+            vec![
+                node("a", "10.0.0.1:8090"),
+                node("bad", ""),
+                node("c", "10.0.0.3:8090"),
+            ],
+            vec![
+                BrainShard {
+                    shard_id: 0,
+                    replicas: vec!["a".to_string()],
+                    preferred_leader: Some("a".to_string()),
+                },
+                // Preferred leader is the malformed node: fall back to a replica
+                // we can actually route to, rather than losing the cluster.
+                BrainShard {
+                    shard_id: 1,
+                    replicas: vec!["bad".to_string(), "c".to_string()],
+                    preferred_leader: Some("bad".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(applied, 2);
+        assert_eq!(table.leader_for(0).as_deref(), Some("http://10.0.0.1:8090"));
+        assert_eq!(table.leader_for(1).as_deref(), Some("http://10.0.0.3:8090"));
+        assert_eq!(
+            table.snapshot()["nodes"],
+            json!(["http://10.0.0.1:8090", "http://10.0.0.3:8090"])
+        );
+    }
+
+    /// A `NotLeader` redirect is the cluster telling us who leads *now*; a brain
+    /// snapshot that was already in flight is older news and must not clobber it.
+    #[test]
+    fn a_redirect_learned_leader_survives_an_in_flight_brain_snapshot() {
+        let table = RouteTable::new(2, vec![]);
+        let node = |id: &str, addr: &str| BrainNode {
+            node_id: id.to_string(),
+            address: addr.to_string(),
+            health: "healthy".to_string(),
+            cloud_provider: None,
+            region: None,
+            cluster_id: None,
+        };
+        let nodes = || vec![node("a", "10.0.0.1:8090"), node("b", "10.0.0.2:8090")];
+        let shards = || {
+            (0..2)
+                .map(|shard_id| BrainShard {
+                    shard_id,
+                    replicas: vec!["a".to_string(), "b".to_string()],
+                    preferred_leader: Some("a".to_string()),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(table.apply_brain_snapshot(nodes(), shards()), 2);
+        assert_eq!(table.leader_for(1).as_deref(), Some("http://10.0.0.1:8090"));
+
+        // Snapshot requested, THEN a node redirects shard 1 to the new leader.
+        let fetched_at = Instant::now();
+        assert!(table
+            .accept_leader_hint(1, "http://10.0.0.2:8090")
+            .is_some());
+        assert_eq!(
+            table.apply_brain_snapshot_at(nodes(), shards(), fetched_at),
+            2
+        );
+        assert_eq!(
+            table.leader_for(1).as_deref(),
+            Some("http://10.0.0.2:8090"),
+            "the redirect-learned leader is newer than the snapshot"
+        );
+        // Shard 0 was never redirected, so the snapshot still owns it.
+        assert_eq!(table.leader_for(0).as_deref(), Some("http://10.0.0.1:8090"));
+
+        // A LATER snapshot supersedes the hint — it is no longer newer.
+        assert_eq!(
+            table.apply_brain_snapshot_at(nodes(), shards(), Instant::now()),
+            2
+        );
+        assert_eq!(table.leader_for(1).as_deref(), Some("http://10.0.0.1:8090"));
+    }
+
+    #[test]
+    fn readiness_follows_route_table_hydration() {
+        // A fresh pod with no seed nodes knows no leader — it must not be ready.
+        let table = RouteTable::new(4, vec![]);
+        assert!(!table.is_hydrated());
+
+        assert_eq!(
+            table.apply_brain_snapshot(
+                vec![BrainNode {
+                    node_id: "a".to_string(),
+                    address: "10.0.0.1:8090".to_string(),
+                    health: "healthy".to_string(),
+                    cloud_provider: None,
+                    region: None,
+                    cluster_id: None,
+                }],
+                (0..4)
+                    .map(|shard_id| BrainShard {
+                        shard_id,
+                        replicas: vec!["a".to_string()],
+                        preferred_leader: Some("a".to_string()),
+                    })
+                    .collect(),
+            ),
+            4
+        );
+        assert!(table.is_hydrated());
     }
 }
