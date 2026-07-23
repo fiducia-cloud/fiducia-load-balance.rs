@@ -72,7 +72,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    fiducia_telemetry::init(SERVICE);
+    let _telemetry = fiducia_telemetry::init(SERVICE);
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let shard_count =
