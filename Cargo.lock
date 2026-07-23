@@ -280,12 +280,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fiducia-interfaces"
+version = "0.1.0"
+source = "git+https://github.com/fiducia-cloud/fiducia-interfaces?rev=e3dba39566e036ad61de91e2e6c1d625ec2b5411#e3dba39566e036ad61de91e2e6c1d625ec2b5411"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fiducia-load-balance"
 version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
- "fiducia-interfaces",
+ "fiducia-interfaces 0.1.0",
  "fiducia-routing",
  "fiducia-telemetry",
  "futures-util",
@@ -305,14 +314,15 @@ dependencies = [
 name = "fiducia-routing"
 version = "0.1.0"
 dependencies = [
- "fiducia-interfaces",
+ "fiducia-interfaces 0.1.0",
 ]
 
 [[package]]
 name = "fiducia-telemetry"
-version = "0.1.0"
-source = "git+https://github.com/fiducia-cloud/fiducia-telemetry.rs?tag=v0.1.0#143382576f4e11e16ad49fde50b4f139883ed51b"
+version = "0.2.1"
+source = "git+https://github.com/fiducia-cloud/fiducia-telemetry.rs?tag=v0.2.1#716853f4c8c230db32e6862232e7162e0f683e1d"
 dependencies = [
+ "fiducia-interfaces 0.1.0 (git+https://github.com/fiducia-cloud/fiducia-interfaces?rev=e3dba39566e036ad61de91e2e6c1d625ec2b5411)",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1909,6 +1919,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1918,12 +1938,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]
