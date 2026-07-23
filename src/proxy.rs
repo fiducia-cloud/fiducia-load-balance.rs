@@ -65,6 +65,12 @@ const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 /// idempotent replay. This prevents a chunked/missing-length node response from
 /// growing the proxy process without limit.
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// Deadline applied to everything on the streaming path that is NOT a confirmed
+/// event-stream body: the header phase, and the buffered body of a response that
+/// turned out not to be `text/event-stream`. Matches the ordinary client's request
+/// timeout, since those phases are ordinary request work. Only the open SSE body
+/// itself is allowed to run without a deadline.
+const STREAM_NON_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const PUBLIC_SCOPES: &[&str] = &[];
 const ADMIN_READ_SCOPES: &[&str] = &["admin:read", "admin:write"];
 const ADMIN_WRITE_SCOPES: &[&str] = &["admin:write"];
@@ -163,6 +169,10 @@ pub async fn route(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Dot segments are refused BEFORE the scope check — see `path_has_dot_segment`.
+    if path_has_dot_segment(uri.path()) {
+        return dot_segment_response(&uri);
+    }
     if let Err(failure) = authorize_route(identity.as_ref(), &method, &uri) {
         return insufficient_scope_response(&method, &uri, failure.required);
     }
@@ -207,6 +217,40 @@ pub async fn route(
 
 struct ScopeFailure {
     required: &'static [&'static str],
+}
+
+/// Does the path contain a `.` or `..` segment?
+///
+/// Authorization matches on `uri.path()` **verbatim**, but the upstream request is
+/// rebuilt through the `url` crate (`client.request(method, url)`), which collapses
+/// dot segments. Those two views of "the path" must never disagree: without this
+/// guard `GET /v1/locks/../observe/locks` authorizes as `locks:read` and still
+/// reaches the admin-only observe inventory (which hands out holders' fencing
+/// tokens — a capability), and `PUT /v1/locks/../kv?key=x` authorizes as
+/// `locks:write` and performs a KV write.
+///
+/// No fiducia route needs a dot segment, so we refuse instead of normalizing. The
+/// percent-encoded spellings the URL standard also treats as dot segments are
+/// covered, since the `url` crate collapses those too.
+fn path_has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        matches!(
+            segment.to_ascii_lowercase().as_str(),
+            "." | "%2e" | ".." | ".%2e" | "%2e." | "%2e%2e"
+        )
+    })
+}
+
+fn dot_segment_response(uri: &Uri) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "invalid_path",
+            "detail": "path may not contain a '.' or '..' segment",
+            "path": uri.path(),
+        })),
+    )
+        .into_response()
 }
 
 fn authorize_route(
@@ -284,6 +328,34 @@ fn required_scopes_for_route(method: &Method, uri: &Uri) -> &'static [&'static s
         ["v1", "elections", ..] => ELECTIONS_WRITE_SCOPES,
         ["v1", "services", ..] if read => SERVICES_READ_SCOPES,
         ["v1", "services", ..] => SERVICES_WRITE_SCOPES,
+        // The remaining primitive families. Without an explicit arm they fall to
+        // the admin catch-all below, and `admin:*` is NOT in fiducia-auth's
+        // `ALLOWED_API_KEY_SCOPES` — so every customer API key would get a 403 on
+        // them. Each family maps onto the issuable scope for the capability class
+        // it really belongs to:
+        //   counters — a keyed value in the KV plane           → kv:*
+        //   barriers, handoffs, claims — mutual exclusion /
+        //     ownership grants, the same capability as a lock  → locks:*
+        //   tasks, effects, decisions — request-lifecycle
+        //     primitives, the same capability as idempotency   → requests:*
+        //   budgets — a spend quota, the same capability as
+        //     a rate limit                                     → rate-limit:*
+        ["v1", "counters", ..] if read => KV_READ_SCOPES,
+        ["v1", "counters", ..] => KV_WRITE_SCOPES,
+        ["v1", "barriers", ..] | ["v1", "handoffs", ..] | ["v1", "claims", ..] if read => {
+            LOCKS_READ_SCOPES
+        }
+        ["v1", "barriers", ..] | ["v1", "handoffs", ..] | ["v1", "claims", ..] => {
+            LOCKS_WRITE_SCOPES
+        }
+        ["v1", "tasks", ..] | ["v1", "effects", ..] | ["v1", "decisions", ..] if read => {
+            REQUESTS_READ_SCOPES
+        }
+        ["v1", "tasks", ..] | ["v1", "effects", ..] | ["v1", "decisions", ..] => {
+            REQUESTS_WRITE_SCOPES
+        }
+        ["v1", "budgets", ..] if read => RATE_LIMIT_READ_SCOPES,
+        ["v1", "budgets", ..] => RATE_LIMIT_WRITE_SCOPES,
         _ if read => ADMIN_READ_SCOPES,
         _ => ADMIN_WRITE_SCOPES,
     }
@@ -1154,6 +1226,29 @@ async fn forward_once(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Upstream {
+    forward_once_with_stream_budget(
+        node_url,
+        identity,
+        method,
+        uri,
+        headers,
+        body,
+        STREAM_NON_BODY_TIMEOUT,
+    )
+    .await
+}
+
+/// `forward_once` with the streaming budget injected, so tests don't have to wait
+/// out the real one.
+async fn forward_once_with_stream_budget(
+    node_url: &str,
+    identity: Option<&VerifiedIdentity>,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+    stream_budget: std::time::Duration,
+) -> Upstream {
     let Some(url) = upstream_url(node_url, uri) else {
         return Upstream::NotSent;
     };
@@ -1198,7 +1293,20 @@ async fn forward_once(
         request = request.header(INTERNAL_AUTH_HEADER, secret);
     }
 
-    let mut response = match request.send().await {
+    // The streaming client has no total request timeout, and `streaming` is chosen
+    // from CLIENT input (Accept / ?watch=true) before the upstream response type is
+    // known. Bound its header phase here so merely *asking* for a stream can't pin
+    // an untimed LB task/socket; only a confirmed `text/event-stream` body below is
+    // allowed to run unbounded.
+    let sent = if streaming {
+        match tokio::time::timeout(stream_budget, request.send()).await {
+            Ok(sent) => sent,
+            Err(_) => return Upstream::AmbiguousTransport,
+        }
+    } else {
+        request.send().await
+    };
+    let mut response = match sent {
         Ok(response) => response,
         Err(error) if error.is_connect() => return Upstream::NotSent,
         Err(_) => return Upstream::AmbiguousTransport,
@@ -1230,6 +1338,27 @@ async fn forward_once(
         *downstream.headers_mut() = response_headers;
         return Upstream::Served(downstream);
     }
+    // Not an event stream, so this is an ordinary buffered response — even if the
+    // caller asked for a stream. Fall back to the timed path: the streaming client
+    // would otherwise drain this body with no deadline at all.
+    let drained = if streaming {
+        match tokio::time::timeout(stream_budget, drain_upstream_body(&mut response)).await {
+            Ok(drained) => drained,
+            Err(_) => return Upstream::AmbiguousTransport,
+        }
+    } else {
+        drain_upstream_body(&mut response).await
+    };
+    let body = match drained {
+        Ok(body) => body,
+        Err(upstream) => return upstream,
+    };
+
+    classify_upstream_response(status, response_headers, Bytes::from(body))
+}
+
+/// Buffer an upstream response body, bounded by [`MAX_UPSTREAM_RESPONSE_BYTES`].
+async fn drain_upstream_body(response: &mut reqwest::Response) -> Result<Vec<u8>, Upstream> {
     let mut body = Vec::new();
     loop {
         match response.chunk().await {
@@ -1238,13 +1367,12 @@ async fn forward_once(
             {
                 body.extend_from_slice(&chunk);
             }
-            Ok(Some(_)) => return Upstream::ResponseTooLarge,
+            Ok(Some(_)) => return Err(Upstream::ResponseTooLarge),
             Ok(None) => break,
-            Err(_) => return Upstream::AmbiguousTransport,
+            Err(_) => return Err(Upstream::AmbiguousTransport),
         }
     }
-
-    classify_upstream_response(status, response_headers, Bytes::from(body))
+    Ok(body)
 }
 
 fn classify_upstream_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Upstream {
@@ -1276,7 +1404,20 @@ fn upstream_url(node_url: &str, uri: &Uri) -> Option<String> {
         return None;
     }
     let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    Some(format!("{}{}", node_url.trim_end_matches('/'), path))
+    let url = format!("{}{}", node_url.trim_end_matches('/'), path);
+    // Defence in depth for the dot-segment escalation `route` already rejects: the
+    // path reqwest will actually request (after `url`'s normalization) must be
+    // EXACTLY the path that was authorized. If they differ at all, don't send.
+    let parsed = reqwest::Url::parse(&url).ok()?;
+    if parsed.path() != uri.path() {
+        tracing::warn!(
+            authorized = %uri.path(),
+            upstream = %parsed.path(),
+            "lb: refusing to forward — upstream URL path differs from the authorized path"
+        );
+        return None;
+    }
+    Some(url)
 }
 
 /// Parse a body-level `NotLeader` hint using the **shared** payload contract
@@ -2584,6 +2725,222 @@ mod tests {
             serde_json::from_slice(&body).unwrap()
         };
         (status, headers, value)
+    }
+
+    /// A dot segment lets the authorized path and the path the `url` crate
+    /// actually requests disagree — `/v1/locks/../observe/locks` authorizes as
+    /// `locks:read` but reaches the admin-only observe inventory. Refuse it.
+    #[tokio::test]
+    async fn dot_segment_paths_are_rejected_before_authorization() {
+        let table = Arc::new(RouteTable::new(4, vec!["http://node-a:8090".to_string()]));
+        for (method, path) in [
+            (Method::GET, "/v1/locks/../observe/locks"),
+            (Method::GET, "/v1/locks/%2e%2e/observe/locks"),
+            (Method::PUT, "/v1/locks/../kv?key=x"),
+            (Method::GET, "/v1/locks/./status"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            let response = route(
+                table.clone(),
+                Some(test_identity("org_1")),
+                method.clone(),
+                uri,
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await;
+            let (status, _, body) = json_response(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} must be refused");
+            assert_eq!(body["error"], "invalid_path");
+        }
+    }
+
+    /// Defence in depth for the same escalation: whatever the caller sends, the
+    /// path reqwest would request must equal the path that was authorized.
+    #[test]
+    fn upstream_url_refuses_a_path_the_url_crate_would_rewrite() {
+        let uri: Uri = "/v1/locks/../observe/locks".parse().unwrap();
+        assert_eq!(upstream_url("http://node-a:8090", &uri), None);
+
+        // The ordinary case is untouched, query string included.
+        let uri: Uri = "/v1/kv?key=orders%2F42".parse().unwrap();
+        assert_eq!(
+            upstream_url("http://node-a:8090/", &uri).as_deref(),
+            Some("http://node-a:8090/v1/kv?key=orders%2F42")
+        );
+    }
+
+    /// Every family the router knows must resolve to a scope a customer API key
+    /// can actually be issued — otherwise the family is unreachable for every
+    /// customer. `admin:*` is the operator escape hatch and is deliberately NOT
+    /// issuable, so it doesn't count towards reachability.
+    #[test]
+    fn every_routed_family_is_reachable_with_an_issuable_api_key_scope() {
+        // Mirrors `ALLOWED_API_KEY_SCOPES` in fiducia-auth.rs/src/main.rs — the
+        // only scopes an API key can ever carry.
+        const ISSUABLE: &[&str] = &[
+            "requests:read",
+            "requests:write",
+            "locks:read",
+            "locks:write",
+            "kv:read",
+            "kv:write",
+            "services:read",
+            "services:write",
+            "elections:read",
+            "elections:write",
+            "cron:read",
+            "cron:write",
+            "rate-limit:read",
+            "rate-limit:write",
+        ];
+        const FAMILIES: &[&str] = &[
+            "kv",
+            "locks",
+            "semaphores",
+            "rw",
+            "idempotency",
+            "rate-limit",
+            "cron",
+            "elections",
+            "services",
+            "counters",
+            "barriers",
+            "tasks",
+            "effects",
+            "handoffs",
+            "decisions",
+            "budgets",
+            "claims",
+        ];
+
+        for family in FAMILIES {
+            for method in [Method::GET, Method::POST] {
+                let uri: Uri = format!("/v1/{family}").parse().unwrap();
+                let required = required_scopes_for_route(&method, &uri);
+                let issuable: Vec<_> = required
+                    .iter()
+                    .filter(|scope| !scope.starts_with("admin:"))
+                    .collect();
+                assert!(
+                    !issuable.is_empty(),
+                    "/v1/{family} ({method}) requires only non-issuable scopes: {required:?}"
+                );
+                for scope in issuable {
+                    assert!(
+                        ISSUABLE.contains(scope),
+                        "/v1/{family} ({method}) requires {scope}, which fiducia-auth cannot issue"
+                    );
+                }
+                // And a key holding that scope really passes the gate.
+                let granted = required.iter().find(|s| !s.starts_with("admin:")).unwrap();
+                let identity = identity_with_scopes(&[granted]);
+                assert!(
+                    authorize_route(Some(&identity), &method, &uri).is_ok(),
+                    "/v1/{family} ({method}) must admit a {granted} key"
+                );
+            }
+        }
+    }
+
+    /// The eight families that used to fall through to the admin catch-all are
+    /// closed to a customer key no matter what scope it holds.
+    #[test]
+    fn previously_unreachable_families_no_longer_require_admin() {
+        for (path, read_scope, write_scope) in [
+            ("/v1/counters/hits", "kv:read", "kv:write"),
+            ("/v1/barriers/b1", "locks:read", "locks:write"),
+            ("/v1/handoffs/h1", "locks:read", "locks:write"),
+            ("/v1/claims/c1", "locks:read", "locks:write"),
+            ("/v1/tasks/t1", "requests:read", "requests:write"),
+            ("/v1/effects/e1", "requests:read", "requests:write"),
+            ("/v1/decisions/d1", "requests:read", "requests:write"),
+            ("/v1/budgets/b1", "rate-limit:read", "rate-limit:write"),
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            let reader = identity_with_scopes(&[read_scope]);
+            let writer = identity_with_scopes(&[write_scope]);
+            assert!(authorize_route(Some(&reader), &Method::GET, &uri).is_ok());
+            assert!(authorize_route(Some(&writer), &Method::POST, &uri).is_ok());
+            // A read-only key still can't mutate.
+            assert!(authorize_route(Some(&reader), &Method::POST, &uri).is_err());
+        }
+    }
+
+    /// A client can ASK for a stream (`Accept`/`?watch=true`) and get an ordinary
+    /// response back. The streaming client has no request timeout, so without a
+    /// bound on the header + non-stream body phases any caller could pin an LB
+    /// task forever on an upstream that simply never finishes its body.
+    #[tokio::test]
+    async fn a_streaming_request_answered_with_a_non_stream_body_is_still_timed() {
+        // Upstream promises 100 bytes, sends one, and holds the socket open.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\nx")
+                .await
+                .unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            forward_once_with_stream_budget(
+                &format!("http://{address}"),
+                None,
+                &Method::GET,
+                &"/v1/kv?key=x&watch=true".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                std::time::Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("a non-SSE response on the streaming path must not hang the LB");
+        assert!(
+            matches!(result, Upstream::AmbiguousTransport),
+            "expected the stream budget to fire, got {result:?}"
+        );
+        server.abort();
+    }
+
+    /// The same budget bounds the header phase, before any response type is known.
+    #[tokio::test]
+    async fn a_streaming_request_with_a_silent_upstream_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            forward_once_with_stream_budget(
+                &format!("http://{address}"),
+                None,
+                &Method::GET,
+                &"/v1/kv?key=x".parse().unwrap(),
+                &headers,
+                Bytes::new(),
+                std::time::Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("a silent upstream on the streaming path must not hang the LB");
+        assert!(
+            matches!(result, Upstream::AmbiguousTransport),
+            "expected the stream budget to fire, got {result:?}"
+        );
+        server.abort();
     }
 }
 

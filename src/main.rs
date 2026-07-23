@@ -48,6 +48,16 @@ const ADMIN_READ_SCOPES: &[&str] = &["admin:read", "admin:write"];
 /// **no request timeout** — the LB proxies blocking lock acquires / long-poll.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// Shard count from the environment, clamped to at least 1 exactly like the node
+/// does: `fiducia_routing::shard_for` asserts a non-zero count, so a `0` here
+/// would panic on every keyed request instead of just being a silly config.
+fn shard_count_from_env_value(value: Option<&str>) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(16)
+        .max(1)
+}
+
 #[derive(Debug, Clone)]
 struct TlsSettings {
     cert_path: String,
@@ -67,10 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _telemetry = fiducia_telemetry::init(SERVICE);
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let shard_count: u32 = std::env::var("FIDUCIA_SHARD_COUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+    let shard_count =
+        shard_count_from_env_value(std::env::var("FIDUCIA_SHARD_COUNT").ok().as_deref());
 
     // Seed node list (provisional leaders, round-robin) until the brain refresh
     // / redirects fill in the real shard→leader map.
@@ -104,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let app = build_app(Arc::new(AppState {
         auth,
-        routes: table,
+        routes: table.clone(),
     }));
 
     let port: u16 = std::env::var("PORT")
@@ -141,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
              proxying or Host-derived redirects)",
             tls = tls.port,
         );
-        let guard = build_plaintext_guard_app();
+        let guard = build_plaintext_guard_app(table.clone());
         let http = serve_http(http_addr, guard);
         let https = serve_https(tls_addr, app, tls);
         tokio::select! {
@@ -163,9 +171,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
-        // LB's own liveness (not proxied).
+        // LB's own liveness (not proxied) and readiness (route table hydrated).
         .route("/healthz", get(healthz))
-        .route("/readyz", get(healthz))
+        .route("/readyz", get(readyz))
         // Operator/debug surface under /_lb (kept off the proxied namespace).
         .route("/_lb/routes", get(routes_dump))
         .route("/_lb/resolve", get(resolve))
@@ -184,11 +192,14 @@ fn build_app(state: Arc<AppState>) -> Router {
 /// cleartext: every non-probe path is answered with `426 Upgrade Required`.
 /// This carries no `AppState` — it never touches auth, the route table, an
 /// upstream node, or an untrusted Host header.
-fn build_plaintext_guard_app() -> Router {
+fn build_plaintext_guard_app(routes: Arc<RouteTable>) -> Router {
     Router::new()
-        // k8s liveness/readiness probes target these on the plaintext port.
+        // k8s liveness/readiness probes target these on the plaintext port — which
+        // is where the readiness probe lives even with TLS on, so the guard has to
+        // answer readiness truthfully too (hence the route table, and nothing else).
         .route("/healthz", get(healthz))
-        .route("/readyz", get(healthz))
+        .route("/readyz", get(guard_readyz))
+        .with_state(routes)
         // Everything else must speak HTTPS — never proxied or redirected using
         // caller-controlled authority data.
         .fallback(plaintext_upgrade_required)
@@ -253,6 +264,33 @@ fn tls_settings() -> Result<Option<TlsSettings>, Box<dyn std::error::Error + Sen
 
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
+}
+
+/// `GET /readyz` — readiness, which is NOT liveness: a fresh pod is alive long
+/// before it knows any route. Until the seed/brain refresh hydrates the shard→
+/// leader map the LB can only answer `503 no_route` to real traffic, so it must
+/// stay out of the Service's endpoint list (see the deployment's readinessProbe).
+async fn readyz(State(state): State<Arc<AppState>>) -> Response {
+    readiness_response(&state.routes)
+}
+
+async fn guard_readyz(State(routes): State<Arc<RouteTable>>) -> Response {
+    readiness_response(&routes)
+}
+
+fn readiness_response(routes: &RouteTable) -> Response {
+    if !routes.is_hydrated() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "service": SERVICE,
+                "detail": "route table is not hydrated yet",
+            })),
+        )
+            .into_response();
+    }
+    Json(json!({ "status": "ok", "service": SERVICE })).into_response()
 }
 
 /// Catch-all: route a client request to the owning shard's leader.
@@ -498,7 +536,54 @@ mod interface_contract_tests {
 
         // The guard router only registers the two probe routes as real handlers;
         // building it must not panic.
-        let _ = build_plaintext_guard_app();
+        let _ = build_plaintext_guard_app(Arc::new(RouteTable::new(4, vec![])));
+    }
+
+    /// Readiness is not liveness: a pod that knows no route can only answer
+    /// `503 no_route`, so it must stay out of the Service's endpoints until the
+    /// route table is hydrated — on the TLS guard's plaintext port too, which is
+    /// where the readinessProbe actually points.
+    #[tokio::test]
+    async fn readyz_is_503_until_the_route_table_is_hydrated() {
+        let empty = Arc::new(RouteTable::new(4, vec![]));
+        let state = Arc::new(AppState {
+            auth: auth::AuthState::from_env(),
+            routes: empty.clone(),
+        });
+        assert_eq!(
+            readyz(State(state)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            guard_readyz(State(empty)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // Liveness stays up regardless — the process is healthy, just not routable.
+        let hydrated = Arc::new(RouteTable::new(4, vec!["http://node-a:8090".to_string()]));
+        let state = Arc::new(AppState {
+            auth: auth::AuthState::from_env(),
+            routes: hydrated.clone(),
+        });
+        assert_eq!(readyz(State(state)).await.status(), StatusCode::OK);
+        assert_eq!(guard_readyz(State(hydrated)).await.status(), StatusCode::OK);
+    }
+
+    /// `shard_for` asserts a non-zero shard count, so an unset/zero/garbage
+    /// `FIDUCIA_SHARD_COUNT` must clamp exactly like the node's does rather than
+    /// panic on every keyed request.
+    #[test]
+    fn shard_count_is_clamped_to_at_least_one() {
+        assert_eq!(shard_count_from_env_value(None), 16);
+        assert_eq!(shard_count_from_env_value(Some("")), 16);
+        assert_eq!(shard_count_from_env_value(Some("not-a-number")), 16);
+        assert_eq!(shard_count_from_env_value(Some("0")), 1);
+        assert_eq!(shard_count_from_env_value(Some(" 32 ")), 32);
+        // The clamp is what keeps `shard_for` from asserting.
+        assert_eq!(
+            shard_for("orders/42", shard_count_from_env_value(Some("0"))),
+            0
+        );
     }
 
     fn test_identity(scopes: &[&str]) -> auth::VerifiedIdentity {

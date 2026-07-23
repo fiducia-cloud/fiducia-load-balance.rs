@@ -34,6 +34,12 @@ const DEFAULT_JWT_CACHE_TTL_SECS: u64 = 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 2;
 const DEFAULT_JWT_ISSUER: &str = "fiducia-auth";
 const DEFAULT_JWT_AUDIENCE: &str = "fiducia-api";
+/// Hard cap on cached auth decisions. The cache is keyed by the SHA-256 of a
+/// CALLER-SUPPLIED token, so without a bound anyone spraying tokens at a public
+/// edge grows it forever (expired entries were only ignored, never removed).
+/// Sized well above any real org's live-credential count; the sweep below keeps
+/// steady-state occupancy far under it.
+const MAX_CACHED_DECISIONS: usize = 10_000;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -296,13 +302,39 @@ impl AuthState {
         if ttl.is_zero() {
             return;
         }
-        self.decisions.write().await.insert(
+        let now = Instant::now();
+        let mut decisions = self.decisions.write().await;
+        prune_decisions(&mut decisions, now, MAX_CACHED_DECISIONS);
+        decisions.insert(
             key,
             CachedDecision {
-                expires_at: Instant::now() + ttl,
+                expires_at: now + ttl,
                 identity,
             },
         );
+    }
+}
+
+/// Keep the decision cache bounded. Entries expire logically, but nothing removed
+/// them, so token spraying against a public edge grew the map without limit. When
+/// the cache reaches `capacity` we sweep everything already expired, and if every
+/// entry is still live we evict the one closest to expiry to make room. This only
+/// runs on a cache MISS (behind an introspection round trip), never on the hot
+/// path, so the O(n) sweep is not a request-latency concern.
+fn prune_decisions(decisions: &mut HashMap<String, CachedDecision>, now: Instant, capacity: usize) {
+    if decisions.len() < capacity {
+        return;
+    }
+    decisions.retain(|_, cached| cached.expires_at > now);
+    if decisions.len() < capacity {
+        return;
+    }
+    let soonest = decisions
+        .iter()
+        .min_by_key(|(_, cached)| cached.expires_at)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = soonest {
+        decisions.remove(&key);
     }
 }
 
@@ -848,5 +880,65 @@ mod tests {
         assert_eq!(identity.key_id.as_deref(), Some("key_1"));
         assert_eq!(identity.scopes_header(), "kv:read");
         assert!(identity.require_idempotency);
+    }
+
+    /// The decision cache is keyed by the hash of a caller-supplied token, so an
+    /// attacker spraying tokens at a public edge must not be able to grow it
+    /// without bound: expired entries are swept, and the cap holds regardless.
+    #[test]
+    fn decision_cache_is_bounded_and_sweeps_expired_entries() {
+        let now = Instant::now();
+        let live = |offset: u64| CachedDecision {
+            expires_at: now + Duration::from_secs(offset),
+            identity: None,
+        };
+        let expired = CachedDecision {
+            expires_at: now - Duration::from_secs(1),
+            identity: None,
+        };
+
+        // Below capacity: nothing is touched, even an already-expired entry.
+        let mut decisions = HashMap::from([("expired".to_string(), expired.clone())]);
+        prune_decisions(&mut decisions, now, 4);
+        assert_eq!(decisions.len(), 1);
+
+        // At capacity with expired entries: those are swept.
+        let mut decisions = HashMap::from([
+            ("a".to_string(), expired.clone()),
+            ("b".to_string(), expired),
+            ("c".to_string(), live(60)),
+            ("d".to_string(), live(60)),
+        ]);
+        prune_decisions(&mut decisions, now, 4);
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.contains_key("c") && decisions.contains_key("d"));
+
+        // At capacity with everything still live: the soonest to expire is evicted
+        // so a spray can never push the map past the cap.
+        let mut decisions = HashMap::from([
+            ("soonest".to_string(), live(1)),
+            ("b".to_string(), live(60)),
+            ("c".to_string(), live(60)),
+            ("d".to_string(), live(60)),
+        ]);
+        prune_decisions(&mut decisions, now, 4);
+        assert_eq!(decisions.len(), 3);
+        assert!(!decisions.contains_key("soonest"));
+    }
+
+    /// End to end through the real cache: many distinct tokens, bounded map.
+    #[tokio::test]
+    async fn caching_many_distinct_tokens_never_exceeds_the_cap() {
+        let state = AuthState::from_env();
+        for i in 0..(MAX_CACHED_DECISIONS + 500) {
+            state
+                .cache_decision(
+                    credential_cache_key("api_key", &format!("sprayed-{i}")),
+                    None,
+                    Duration::from_secs(300),
+                )
+                .await;
+            assert!(state.decisions.read().await.len() <= MAX_CACHED_DECISIONS);
+        }
     }
 }
