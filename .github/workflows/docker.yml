@@ -37,7 +37,7 @@ jobs:
           provenance: mode=max
           sbom: true
           build-args: |
-            INTERFACES_REF=6e20a3f4df2e52b99a0ad6add83d4528262b5dbc
-            ROUTING_REF=543b4ea3b3bba28b66c15a97a27514488d2ccce3
+            INTERFACES_REF=2c5c806174e067fbe83ad48b724366323ba390a2
+            ROUTING_REF=c694bc5c58587bec12989a347e926c0040aacada
           tags: |
             ghcr.io/fiducia-cloud/fiducia-load-balance:${{ github.sha }}
