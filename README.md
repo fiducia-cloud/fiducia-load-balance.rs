@@ -150,7 +150,7 @@ CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
 immutable sibling revisions for the local path dependencies:
 
 - `fiducia-interfaces` at
-  `2c5c806174e067fbe83ad48b724366323ba390a2`
+  `bd718cd72d72aa330534f3688f8fb1ce90c19d10`
 - `fiducia-routing.rs` at
   `c694bc5c58587bec12989a347e926c0040aacada`
 
