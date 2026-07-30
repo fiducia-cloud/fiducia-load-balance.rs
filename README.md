@@ -3,7 +3,7 @@
 The **edge, key-aware load balancer** for [fiducia.cloud](https://fiducia.cloud).
 End clients speak **HTTP or HTTPS** to this service; it routes each request to the
 **leader of the shard that owns the request's key**. It handles byte-level
-forwarding, `NotLeader` redirects, and control-plane refresh from `fiducia-brain`.
+forwarding, `NotLeader` retries, and control-plane refresh from `fiducia-brain`.
 
 ## Why it exists
 
@@ -19,9 +19,12 @@ It keeps a `shard → leader` cache that is **allowed to be stale**:
 
 - **Fast path** — cache says who leads the shard; forward straight there.
 - **Backstop** — if the cache is wrong and the request lands on a follower, the
-  node replies `NotLeader` (HTTP `307` + leader hint); the LB follows it only
-  when the target is present in brain's healthy membership, then updates the
-  cache. An arbitrary redirect can never receive the trusted-hop secret.
+  node replies `503 NotLeader` with an explicit marker and an optional
+  trusted-hop leader hint; the LB retries it only when the target is present in
+  brain's healthy membership, then updates the cache. Legacy `307`/`421`
+  responses remain accepted during rolling upgrades, but automatic HTTP
+  redirect-following stays disabled. An arbitrary target can never receive the
+  trusted-hop secret.
 - **No-hint fallback** — if a follower explicitly says `NotLeader` but cannot
   name the leader, the LB may try another known node. Transport failures are
   retried only for reads: a mutation with a lost response is ambiguous and is
@@ -51,7 +54,7 @@ Cloudflare should route to a healthy Fiducia LB, preferably the LB closest to th
 customer-selected region. It should not try to route directly to a shard leader;
 leader knowledge belongs to the LB/control-plane cache. The LB hashes the request
 key to a shard, forwards to the best-known leader, and learns a newer leader from
-node `NotLeader` redirects. If a follower cannot name the leader, the LB falls
+node `NotLeader` hints. If a follower cannot name the leader, the LB falls
 back to the known-node round-robin pool.
 
 Auth is still checked at the LB boundary. The public edge should reject most bad
@@ -91,11 +94,11 @@ origin at the LB HTTPS port; do not route Cloudflare directly to node pods.
 | Plane | Transport | Where |
 |-------|-----------|-------|
 | client ↔ LB | **HTTP or HTTPS**; TLS can terminate here | this crate |
-| LB ↔ node | plain HTTP to the shard leader or redirect target | this crate |
+| LB ↔ node | plain HTTP to the shard leader or validated retry target | this crate |
 | node ↔ node (Raft replication) | direct peer RPC to `/raft/{shard}/{append,vote}` using `FIDUCIA_PEERS`; bypasses the LB | `fiducia-node`'s `Transport` — **not** here |
 
 HTTP is first-class for clients precisely because a leader change becomes a
-redirect on the next stateless request — nothing to migrate. (Note: the *edge*
+bounded retry on the next stateless request—nothing to migrate. (Note: the *edge*
 cuts client↔LB RTT, but a strongly-consistent write still has to reach the shard
 leader + a quorum; the brain placing leaders near demand is what helps the
 commit.)

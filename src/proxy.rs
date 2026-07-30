@@ -2,12 +2,13 @@
 //!
 //! HTTP is the first-class client protocol, so forwarding is a plain HTTP
 //! reverse-proxy hop with one extra rule: if the chosen node turns out to be a
-//! *follower* for the request's shard, it answers `NotLeader` (an HTTP `307` with
-//! a `Location`/leader hint, or a JSON body), and we retry against the named
-//! leader — updating the cache so the next request skips the bounce.
+//! *follower* for the request's shard, it answers `NotLeader` (`503` plus a
+//! trusted-hop leader hint; legacy nodes may still use `307`/`421`), and we retry
+//! against the named leader — updating the cache so the next request skips the
+//! bounce.
 //!
-//! This is why HTTP beats TCP here: a leader change is just a redirect on the
-//! next stateless request, with nothing to migrate. (Blocking lock acquires use
+//! This is why HTTP beats TCP here: a leader change is just a bounded retry on
+//! the next stateless request, with nothing to migrate. (Blocking lock acquires use
 //! HTTP long-poll; there is no persistent client socket to fail over.)
 //!
 //! The routing decision and redirect loop are both real. `NotLeader` is a
@@ -146,7 +147,8 @@ enum Upstream {
     /// The node served the request (any normal status code).
     Served(Response),
     /// The node is a follower for the request's shard; retry against `leader`
-    /// (from the `307 Location` / JSON hint) if it named one.
+    /// (from the current trusted-hop header/body hint or a legacy `Location`) if
+    /// it named one.
     NotLeader { leader: Option<String> },
     /// Request construction or connection establishment failed before an
     /// upstream could receive the request. Safe to retry on another node even
@@ -1139,17 +1141,17 @@ fn method_is_replay_safe(method: &Method) -> bool {
 
 /// Forward one request to one node and classify the result.
 ///
-/// NotLeader contract: followers may answer either `307` with a `Location`
-/// header or `421` with `x-fiducia-leader`/JSON leader hints. In both cases the
+/// NotLeader contract: current followers answer `503` with
+/// `x-fiducia-not-leader` and an optional `x-fiducia-leader` hint. Rolling
+/// upgrades may still surface legacy `307`/`421` responses. In every case the
 /// Shared proxy client with redirect-following **disabled on purpose**.
 ///
-/// A follower answers a write with `307`/`421` + an `x-fiducia-leader` hint, and
+/// A follower answers a write with the explicit marker + a leader hint, and
 /// we handle that hop ourselves in [`classify`] — re-issuing the *original*
 /// request path against the leader. If we let reqwest auto-follow, it would chase
-/// the node's `Location` header, which is the nest-stripped path (`/acquire`, not
-/// `/v1/locks/acquire`, since the handler runs under a nested router) and 404 —
-/// exactly the failure seen when the LB's cached leader is stale. Keeping the hop
-/// in our hands means we always retry with the path *we* received.
+/// a legacy node's `Location` and could forward trusted credentials to a
+/// server-selected target. Keeping the hop in our hands means we validate the
+/// hint against healthy membership and always retry with the path *we* received.
 fn proxy_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -1376,17 +1378,20 @@ async fn drain_upstream_body(response: &mut reqwest::Response) -> Result<Vec<u8>
 }
 
 fn classify_upstream_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Upstream {
-    if status == StatusCode::TEMPORARY_REDIRECT || status == StatusCode::MISDIRECTED_REQUEST {
+    let marked_not_leader = header_value(&headers, "x-fiducia-not-leader")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if status == StatusCode::TEMPORARY_REDIRECT
+        || status == StatusCode::MISDIRECTED_REQUEST
+        || (status == StatusCode::SERVICE_UNAVAILABLE && marked_not_leader)
+    {
         let leader = header_value(&headers, "x-fiducia-leader").or_else(|| {
             header_value(&headers, LOCATION.as_str()).and_then(|v| leader_base_url(&v))
         });
         return Upstream::NotLeader { leader };
     }
 
-    if let Some(leader) = json_not_leader_hint(&body) {
-        return Upstream::NotLeader {
-            leader: Some(leader),
-        };
+    if let Some(leader) = json_not_leader(&body) {
+        return Upstream::NotLeader { leader };
     }
 
     let mut response = Response::new(Body::from(body));
@@ -1424,12 +1429,12 @@ fn upstream_url(node_url: &str, uri: &Uri) -> Option<String> {
 /// (`fiducia_interfaces::ProposeError`), so the LB and node can't drift on the
 /// redirect shape. The node nests the error under `"error"`; a bare error is
 /// also accepted.
-fn json_not_leader_hint(body: &[u8]) -> Option<String> {
+fn json_not_leader(body: &[u8]) -> Option<Option<String>> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let error = value.get("error").cloned().unwrap_or(value);
     let parsed: fiducia_interfaces::ProposeError = serde_json::from_value(error).ok()?;
     match parsed.reason {
-        fiducia_interfaces::ProposeErrorReason::NotLeader => parsed.leader,
+        fiducia_interfaces::ProposeErrorReason::NotLeader => Some(parsed.leader),
         fiducia_interfaces::ProposeErrorReason::Unavailable => None,
     }
 }
@@ -1721,16 +1726,12 @@ mod tests {
     }
 
     #[test]
-    fn classifies_node_not_leader_redirect_from_headers() {
+    fn classifies_current_node_not_leader_response_from_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-fiducia-not-leader", "true".parse().unwrap());
         headers.insert("x-fiducia-leader", "http://leader-a:8090".parse().unwrap());
-        headers.insert(
-            LOCATION,
-            "http://leader-a:8090/v1/kv/orders".parse().unwrap(),
-        );
 
-        match classify_upstream_response(StatusCode::TEMPORARY_REDIRECT, headers, Bytes::new()) {
+        match classify_upstream_response(StatusCode::SERVICE_UNAVAILABLE, headers, Bytes::new()) {
             Upstream::NotLeader { leader } => {
                 assert_eq!(leader.as_deref(), Some("http://leader-a:8090"));
             }
@@ -1740,14 +1741,12 @@ mod tests {
 
     #[test]
     fn follower_without_a_leader_hint_yields_none_so_the_lb_round_robins() {
-        // A follower knows it isn't the leader but doesn't know who is: a 307 with
-        // no leader header/Location. The LB gets NotLeader{None} and falls back to
-        // any_node() (round-robin) in forward_with_redirect.
-        match classify_upstream_response(
-            StatusCode::TEMPORARY_REDIRECT,
-            HeaderMap::new(),
-            Bytes::new(),
-        ) {
+        // A follower knows it isn't the leader but doesn't know who is. The LB
+        // gets NotLeader{None} and falls back to any_node() (round-robin) in
+        // forward_with_redirect.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-fiducia-not-leader", "true".parse().unwrap());
+        match classify_upstream_response(StatusCode::SERVICE_UNAVAILABLE, headers, Bytes::new()) {
             Upstream::NotLeader { leader: None } => {}
             other => panic!("expected NotLeader{{leader:None}}, got {other:?}"),
         }
@@ -1756,7 +1755,7 @@ mod tests {
     #[test]
     fn classifies_json_not_leader_fallback() {
         let body = Bytes::from_static(
-            br#"{"committed":false,"error":{"reason":"not_leader","shard":9,"leader":"http://leader-b:8090"}}"#,
+            br#"{"committed":false,"error":{"reason":"not_leader","shard":9,"leader":"http://leader-b:8090","retryable":true}}"#,
         );
 
         match classify_upstream_response(StatusCode::OK, HeaderMap::new(), body) {
@@ -1893,11 +1892,10 @@ mod tests {
 
     #[test]
     fn classifies_not_leader_without_hint_for_round_robin_retry() {
-        match classify_upstream_response(
-            StatusCode::TEMPORARY_REDIRECT,
-            HeaderMap::new(),
-            Bytes::new(),
-        ) {
+        let body = Bytes::from_static(
+            br#"{"committed":false,"error":{"reason":"not_leader","shard":9,"retryable":true}}"#,
+        );
+        match classify_upstream_response(StatusCode::SERVICE_UNAVAILABLE, HeaderMap::new(), body) {
             Upstream::NotLeader { leader } => {
                 assert_eq!(leader, None);
             }
