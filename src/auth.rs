@@ -434,7 +434,7 @@ pub fn trusted_edge_identity(
         Some("jwt") => AuthKind::Jwt,
         Some(_) => return None,
     };
-    let scopes = header_str(headers, "x-fiducia-scopes")
+    let scopes: Vec<String> = header_str(headers, "x-fiducia-scopes")
         .map(|value| value.split_whitespace().map(ToOwned::to_owned).collect())
         .unwrap_or_default();
     if !valid_scopes(&scopes) {
