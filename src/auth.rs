@@ -24,9 +24,7 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, Jwk, JwkSet},
     Algorithm, DecodingKey, Validation,
 };
-use revocation::{
-    Authorization, Claims, HttpRevocationAuthority, RevocationGate, Unavailable,
-};
+use revocation::{Authorization, Claims, HttpRevocationAuthority, RevocationGate, Unavailable};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -446,7 +444,10 @@ pub fn trusted_edge_identity(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    if key_id.as_deref().is_some_and(|value| !valid_identifier(value)) {
+    if key_id
+        .as_deref()
+        .is_some_and(|value| !valid_identifier(value))
+    {
         return None;
     }
 
@@ -822,14 +823,20 @@ mod tests {
     #[test]
     fn extracts_bearer_or_api_key() {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", "bearer   header.payload.signature".parse().unwrap());
+        headers.insert(
+            "authorization",
+            "bearer   header.payload.signature".parse().unwrap(),
+        );
         assert_eq!(
             extract_credential(&headers).as_deref(),
             Some("header.payload.signature")
         );
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", "fdc_live_id.secret".parse().unwrap());
-        assert_eq!(extract_credential(&headers).as_deref(), Some("fdc_live_id.secret"));
+        assert_eq!(
+            extract_credential(&headers).as_deref(),
+            Some("fdc_live_id.secret")
+        );
     }
 
     #[test]
@@ -851,22 +858,15 @@ mod tests {
             exp: 200,
             jti: "token-a".to_string(),
         };
-        assert!(validate_claim_contract(
-            &claims,
-            DEFAULT_JWT_ISSUER,
-            DEFAULT_JWT_AUDIENCE,
-            100
-        )
-        .is_ok());
+        assert!(
+            validate_claim_contract(&claims, DEFAULT_JWT_ISSUER, DEFAULT_JWT_AUDIENCE, 100).is_ok()
+        );
         let mut mismatch = claims.clone();
         mismatch.org_id = "org-b".to_string();
-        assert!(validate_claim_contract(
-            &mismatch,
-            DEFAULT_JWT_ISSUER,
-            DEFAULT_JWT_AUDIENCE,
-            100
-        )
-        .is_err());
+        assert!(
+            validate_claim_contract(&mismatch, DEFAULT_JWT_ISSUER, DEFAULT_JWT_AUDIENCE, 100)
+                .is_err()
+        );
         let mut long_lived = claims;
         long_lived.exp = long_lived.iat + MAX_ACCESS_TOKEN_TTL_SECS + 1;
         assert!(validate_claim_contract(
@@ -882,7 +882,9 @@ mod tests {
     fn reader_secret_contract_is_fail_closed() {
         assert!(valid_reader_secret(&"x".repeat(MIN_READER_SECRET_BYTES)));
         assert!(!valid_reader_secret("short"));
-        assert!(!valid_reader_secret(&("x".repeat(MIN_READER_SECRET_BYTES) + " ")));
+        assert!(!valid_reader_secret(
+            &("x".repeat(MIN_READER_SECRET_BYTES) + " ")
+        ));
     }
 
     #[test]
@@ -935,10 +937,8 @@ mod tests {
         ]);
         prune_decisions(&mut decisions, now, 3);
         assert_eq!(decisions.len(), 2);
-        let mut decisions = HashMap::from([
-            ("soon".to_string(), live(1)),
-            ("b".to_string(), live(60)),
-        ]);
+        let mut decisions =
+            HashMap::from([("soon".to_string(), live(1)), ("b".to_string(), live(60))]);
         prune_decisions(&mut decisions, now, 2);
         assert!(!decisions.contains_key("soon"));
     }
