@@ -155,11 +155,7 @@ pub struct HttpRevocationAuthority {
 }
 
 impl HttpRevocationAuthority {
-    pub fn new(
-        client: reqwest::Client,
-        check_url: String,
-        reader_secret: Option<String>,
-    ) -> Self {
+    pub fn new(client: reqwest::Client, check_url: String, reader_secret: Option<String>) -> Self {
         Self {
             client,
             check_url,
@@ -206,7 +202,9 @@ impl RevocationAuthority for HttpRevocationAuthority {
         let reader_secret = self.reader_secret.clone();
         let claims = claims.clone();
         async move {
-            let secret = reader_secret.as_deref().ok_or(AuthorityError::Misconfigured)?;
+            let secret = reader_secret
+                .as_deref()
+                .ok_or(AuthorityError::Misconfigured)?;
             let response = client
                 .post(check_url)
                 .header(READER_HEADER, secret)
@@ -237,7 +235,9 @@ fn validate_wire_decision(decision: &WireDecision, now: u64) -> Result<(), Autho
     if decision.revoked {
         if decision.matched_target.is_none()
             || decision.generation.is_none()
-            || decision.expires_at.is_none_or(|expires_at| expires_at <= now)
+            || decision
+                .expires_at
+                .is_none_or(|expires_at| expires_at <= now)
         {
             return Err(AuthorityError::Malformed);
         }
@@ -350,10 +350,7 @@ impl<A: RevocationAuthority> RevocationGate<A> {
     }
 
     fn release_key(&self, key: &str, lock: Arc<AsyncMutex<()>>) {
-        let mut locks = self
-            .key_locks
-            .lock()
-            .expect("revocation key-lock mutex");
+        let mut locks = self.key_locks.lock().expect("revocation key-lock mutex");
         if Arc::strong_count(&lock) <= 2 {
             locks.remove(key);
         }
@@ -507,7 +504,10 @@ mod tests {
                 1,
             );
             let first = gate.authorize(&token, 100).await;
-            assert!(matches!(first, Authorization::Allowed | Authorization::Revoked));
+            assert!(matches!(
+                first,
+                Authorization::Allowed | Authorization::Revoked
+            ));
             assert_eq!(
                 gate.authorize(&token, 102).await,
                 Authorization::Unavailable(Unavailable::RefreshFailed)
@@ -574,7 +574,9 @@ mod tests {
         for _ in 0..12 {
             let gate = gate.clone();
             let token = token.clone();
-            joins.push(tokio::spawn(async move { gate.authorize(&token, 100).await }));
+            joins.push(tokio::spawn(
+                async move { gate.authorize(&token, 100).await },
+            ));
         }
         for join in joins {
             assert_eq!(join.await.unwrap(), Authorization::Allowed);
@@ -619,12 +621,17 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             != Some(fixture.secret.as_str())
         {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            );
         }
         (fixture.status, Json(fixture.body))
     }
 
-    async fn fixture_authority(body: Value) -> (HttpRevocationAuthority, tokio::task::JoinHandle<()>) {
+    async fn fixture_authority(
+        body: Value,
+    ) -> (HttpRevocationAuthority, tokio::task::JoinHandle<()>) {
         let fixture = HttpFixture {
             secret: "reader-secret-reader-secret-reader-secret".to_string(),
             body,
