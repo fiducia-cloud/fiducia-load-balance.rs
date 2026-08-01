@@ -666,12 +666,10 @@ mod tests {
             }
         }))
         .await;
-        assert!(
-            !authority
-                .check_revocation(&claims("org-a", "subject-a", "token-a"), 100)
-                .await
-                .unwrap()
-        );
+        assert!(!authority
+            .check_revocation(&claims("org-a", "subject-a", "token-a"), 100)
+            .await
+            .unwrap());
         task.abort();
     }
 
