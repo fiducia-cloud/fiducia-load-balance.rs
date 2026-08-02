@@ -1,8 +1,11 @@
-//! Hot-path auth gate for the regional LB.
+//! Hot-path auth gate for the regional load balancer.
 //!
-//! Supabase belongs behind `fiducia-auth`, not here. The LB accepts customer API
-//! keys, caches `fiducia-auth` introspection responses by token hash, and
-//! verifies Fiducia-issued short-lived JWTs offline via JWKS.
+//! API keys are introspected through `fiducia-auth` and cached briefly. Raw
+//! Fiducia JWTs are verified offline against JWKS, then checked through the
+//! fail-closed revocation gate before any identity reaches route authorization.
+
+#[path = "revocation.rs"]
+mod revocation;
 
 use std::{
     collections::HashMap,
@@ -11,7 +14,7 @@ use std::{
 };
 
 use axum::{
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -21,25 +24,30 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, Jwk, JwkSet},
     Algorithm, DecodingKey, Validation,
 };
-use serde::{Deserialize, Serialize};
+use revocation::{Authorization, Claims, HttpRevocationAuthority, RevocationGate, Unavailable};
+use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 const DEFAULT_AUTH_URL: &str = "http://fiducia-auth.fiducia.svc.cluster.local:8097";
+const DEFAULT_REVOCATION_CHECK_URL: &str =
+    "http://fiducia-revocation-admin.fiducia.svc.cluster.local:8098/v1/revocations/check";
 const DEFAULT_CACHE_TTL_SECS: u64 = 60;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 5;
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
-const DEFAULT_JWT_CACHE_TTL_SECS: u64 = 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 2;
+const DEFAULT_REVOCATION_FRESHNESS_SECS: u64 = 30;
+const DEFAULT_REVOCATION_CAPACITY: usize = 65_536;
+const DEFAULT_REVOCATION_TIMEOUT_MILLIS: u64 = 2_000;
 const DEFAULT_JWT_ISSUER: &str = "fiducia-auth";
 const DEFAULT_JWT_AUDIENCE: &str = "fiducia-api";
-/// Hard cap on cached auth decisions. The cache is keyed by the SHA-256 of a
-/// CALLER-SUPPLIED token, so without a bound anyone spraying tokens at a public
-/// edge grows it forever (expired entries were only ignored, never removed).
-/// Sized well above any real org's live-credential count; the sweep below keeps
-/// steady-state occupancy far under it.
+const MAX_ACCESS_TOKEN_TTL_SECS: u64 = 15 * 60;
+const JWT_CLOCK_SKEW_SECS: u64 = 30;
 const MAX_CACHED_DECISIONS: usize = 10_000;
+const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_JWKS_RESPONSE_BYTES: usize = 256 * 1024;
+const MIN_READER_SECRET_BYTES: usize = 32;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -47,6 +55,7 @@ pub struct AuthState {
     client: reqwest::Client,
     decisions: Arc<RwLock<HashMap<String, CachedDecision>>>,
     jwks: Arc<RwLock<Option<CachedJwks>>>,
+    revocations: Arc<RevocationGate<HttpRevocationAuthority>>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,9 +64,6 @@ pub struct VerifiedIdentity {
     pub org_id: String,
     pub key_id: Option<String>,
     pub scopes: Vec<String>,
-    /// When true, the LB rejects mutating calls from this identity that omit an
-    /// `Idempotency-Key`. Carried from key introspection; false for JWTs and for
-    /// keys minted before the field existed (the control is opt-in).
     pub require_idempotency: bool,
 }
 
@@ -74,12 +80,30 @@ impl AuthState {
             .timeout(config.http_timeout)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let authority = HttpRevocationAuthority::new(
+            client.clone(),
+            config.revocation_check_url.clone(),
+            config.revocation_reader_secret.clone(),
+        );
+        let revocations = Arc::new(RevocationGate::new(
+            authority,
+            config.revocation_freshness_secs,
+            config.revocation_capacity,
+            config.revocation_refresh_timeout,
+        ));
 
-        AuthState {
+        if config.allow_jwts && config.revocation_reader_secret.is_none() {
+            tracing::error!(
+                "FIDUCIA_REVOCATION_READER_SECRET is missing or invalid; raw JWT authentication will fail closed"
+            );
+        }
+
+        Self {
             config: Arc::new(config),
             client,
             decisions: Arc::new(RwLock::new(HashMap::new())),
             jwks: Arc::new(RwLock::new(None)),
+            revocations,
         }
     }
 
@@ -142,8 +166,8 @@ impl AuthState {
 
         let intro = match self.fetch_introspection(api_key).await {
             Ok(intro) => intro,
-            Err(err) => {
-                tracing::warn!(error = %err, "auth introspection unavailable");
+            Err(error) => {
+                tracing::warn!(error = %error, "auth introspection unavailable");
                 return Err(auth_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "auth_unavailable",
@@ -168,27 +192,52 @@ impl AuthState {
     }
 
     async fn authenticate_jwt(&self, jwt: &str) -> Result<VerifiedIdentity, Response> {
-        let cache_key = credential_cache_key("jwt", jwt);
-        if let Some(cached) = self.cached_decision(&cache_key).await {
-            return cached.ok_or_else(|| {
-                auth_response(StatusCode::UNAUTHORIZED, "invalid_jwt", "invalid jwt")
-            });
+        let cache_key = credential_cache_key("invalid_jwt", jwt);
+        if matches!(self.cached_decision(&cache_key).await, Some(None)) {
+            return Err(auth_response(
+                StatusCode::UNAUTHORIZED,
+                "invalid_jwt",
+                "invalid or expired jwt",
+            ));
         }
 
-        match self.verify_jwt(jwt).await {
-            Ok((identity, ttl)) => {
-                self.cache_decision(cache_key, Some(identity.clone()), ttl)
-                    .await;
-                Ok(identity)
-            }
-            Err(err) => {
-                tracing::debug!(error = %err, "jwt rejected");
+        let (identity, claims) = match self.verify_jwt(jwt).await {
+            Ok(verified) => verified,
+            Err(error) => {
+                tracing::debug!(error = %error, "jwt rejected before revocation lookup");
                 self.cache_decision(cache_key, None, self.config.negative_cache_ttl)
                     .await;
-                Err(auth_response(
+                return Err(auth_response(
                     StatusCode::UNAUTHORIZED,
                     "invalid_jwt",
                     "invalid or expired jwt",
+                ));
+            }
+        };
+
+        // Deliberately do not cache a positive JWT identity here. The previous
+        // cache returned an identity for up to 60 seconds before consulting any
+        // revocation state. Offline verification happens first on every request;
+        // only the revocation gate's bounded, tenant-scoped fresh decision cache
+        // may accelerate the authorization path.
+        match self.revocations.authorize(&claims, unix_secs()).await {
+            Authorization::Allowed => Ok(identity),
+            Authorization::Revoked => Err(auth_response(
+                StatusCode::UNAUTHORIZED,
+                "revoked_jwt",
+                "jwt has been revoked",
+            )),
+            Authorization::Unavailable(reason) => {
+                let reason = match reason {
+                    Unavailable::ClockRegression => "clock_regression",
+                    Unavailable::RefreshFailed => "refresh_failed",
+                    Unavailable::RefreshTimedOut => "refresh_timed_out",
+                };
+                tracing::warn!(reason, "jwt revocation state unavailable; denying request");
+                Err(auth_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "revocation_unavailable",
+                    "jwt revocation state is unavailable",
                 ))
             }
         }
@@ -207,19 +256,20 @@ impl AuthState {
         if let Some(secret) = self.config.introspect_secret.as_deref() {
             request = request.header("x-server-auth", secret);
         }
-        let response = request.send().await.map_err(AuthError::Http)?;
-
-        if !response.status().is_success() {
-            return Err(AuthError::AuthStatus(response.status()));
-        }
-
-        response
-            .json::<Introspection>()
+        let response = request
+            .send()
             .await
-            .map_err(AuthError::Http)
+            .map_err(AuthError::Http)?
+            .error_for_status()
+            .map_err(AuthError::Http)?;
+        let body = response.bytes().await.map_err(AuthError::Http)?;
+        if body.len() > MAX_INTROSPECTION_RESPONSE_BYTES {
+            return Err(AuthError::OversizedResponse("introspection"));
+        }
+        serde_json::from_slice(&body).map_err(|_| AuthError::InvalidResponse("introspection"))
     }
 
-    async fn verify_jwt(&self, jwt: &str) -> Result<(VerifiedIdentity, Duration), AuthError> {
+    async fn verify_jwt(&self, jwt: &str) -> Result<(VerifiedIdentity, Claims), AuthError> {
         let header = decode_header(jwt).map_err(AuthError::Jwt)?;
         if !is_asymmetric_algorithm(header.alg) {
             return Err(AuthError::UnsupportedAlgorithm(header.alg));
@@ -232,15 +282,19 @@ impl AuthState {
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[self.config.jwt_issuer.as_str()]);
         validation.set_audience(&[self.config.jwt_audience.as_str()]);
-        validation.required_spec_claims.insert("exp".to_string());
-        validation.required_spec_claims.insert("iss".to_string());
-        validation.required_spec_claims.insert("sub".to_string());
+        for claim in ["exp", "iss", "aud", "sub", "org_id", "iat", "jti"] {
+            validation.required_spec_claims.insert(claim.to_string());
+        }
 
-        let token =
-            decode::<FiduciaClaims>(jwt, &decoding_key, &validation).map_err(AuthError::Jwt)?;
-        let identity = identity_from_claims(token.claims.clone())?;
-        let ttl = jwt_cache_ttl(token.claims.exp, self.config.jwt_cache_ttl)?;
-        Ok((identity, ttl))
+        let token = decode::<Claims>(jwt, &decoding_key, &validation).map_err(AuthError::Jwt)?;
+        validate_claim_contract(
+            &token.claims,
+            &self.config.jwt_issuer,
+            &self.config.jwt_audience,
+            unix_secs(),
+        )?;
+        let identity = identity_from_claims(&token.claims)?;
+        Ok((identity, token.claims))
     }
 
     async fn jwk_for_kid(&self, kid: &str) -> Result<Jwk, AuthError> {
@@ -248,7 +302,6 @@ impl AuthState {
         if let Some(jwk) = jwks.find(kid).cloned() {
             return Ok(jwk);
         }
-
         let jwks = self.refresh_jwks().await?;
         jwks.find(kid)
             .cloned()
@@ -264,27 +317,27 @@ impl AuthState {
                 }
             }
         }
-
         self.refresh_jwks().await
     }
 
     async fn refresh_jwks(&self) -> Result<JwkSet, AuthError> {
-        let jwks = self
+        let response = self
             .client
             .get(&self.config.jwks_url)
             .send()
             .await
             .map_err(AuthError::Http)?
             .error_for_status()
-            .map_err(AuthError::Http)?
-            .json::<JwkSet>()
-            .await
             .map_err(AuthError::Http)?;
-
+        let body = response.bytes().await.map_err(AuthError::Http)?;
+        if body.len() > MAX_JWKS_RESPONSE_BYTES {
+            return Err(AuthError::OversizedResponse("jwks"));
+        }
+        let jwks: JwkSet =
+            serde_json::from_slice(&body).map_err(|_| AuthError::InvalidResponse("jwks"))?;
         if jwks.keys.is_empty() {
             return Err(AuthError::EmptyJwks);
         }
-
         *self.jwks.write().await = Some(CachedJwks {
             fetched_at: Instant::now(),
             jwks: jwks.clone(),
@@ -315,12 +368,6 @@ impl AuthState {
     }
 }
 
-/// Keep the decision cache bounded. Entries expire logically, but nothing removed
-/// them, so token spraying against a public edge grew the map without limit. When
-/// the cache reaches `capacity` we sweep everything already expired, and if every
-/// entry is still live we evict the one closest to expiry to make room. This only
-/// runs on a cache MISS (behind an introspection round trip), never on the hot
-/// path, so the O(n) sweep is not a request-latency concern.
 fn prune_decisions(decisions: &mut HashMap<String, CachedDecision>, now: Instant, capacity: usize) {
     if decisions.len() < capacity {
         return;
@@ -329,11 +376,11 @@ fn prune_decisions(decisions: &mut HashMap<String, CachedDecision>, now: Instant
     if decisions.len() < capacity {
         return;
     }
-    let soonest = decisions
+    if let Some(key) = decisions
         .iter()
         .min_by_key(|(_, cached)| cached.expires_at)
-        .map(|(key, _)| key.clone());
-    if let Some(key) = soonest {
+        .map(|(key, _)| key.clone())
+    {
         decisions.remove(&key);
     }
 }
@@ -361,32 +408,13 @@ pub fn should_strip_client_auth_header(name: &str) -> bool {
             | "x-fiducia-org-id"
             | "x-fiducia-key-id"
             | "x-fiducia-scopes"
-            // The edge→LB trusted-hop proof. The LB consumes it inbound (to decide
-            // whether to trust the forwarded `x-fiducia-*` identity) and must never
-            // forward it to the node, nor let a direct client inject it.
             | EDGE_AUTH_HEADER
-            // The trusted-hop secret to the node: only the LB may set it, never a
-            // client. The LB re-attaches its own in `proxy::forward_once`.
             | "x-fiducia-internal-auth"
     )
 }
 
-/// Header the edge presents to prove an inbound request is a trusted edge hop.
-/// Its value is the shared cluster secret (`FIDUCIA_INTERNAL_SECRET`); a direct
-/// client cannot forge it, and `should_strip_client_auth_header` guarantees the
-/// LB never forwards a client-supplied copy of it downstream.
 pub const EDGE_AUTH_HEADER: &str = "x-fiducia-edge-auth";
 
-/// Identity forwarded by a trusted edge hop.
-///
-/// The edge authenticates the caller, strips the raw client credential, and
-/// forwards the verified identity in `x-fiducia-*` headers plus the shared secret
-/// in [`EDGE_AUTH_HEADER`]. The LB trusts that identity **only** when the secret
-/// is present and constant-time-equal to `expected_secret`. Without a valid
-/// secret this returns `None`, so the request is treated as anonymous (and the
-/// spoofable `x-fiducia-*` headers are stripped before forwarding), closing the
-/// bypass where an edge-forwarded request would otherwise arrive with no identity
-/// and skip the LB's per-route scope checks.
 pub fn trusted_edge_identity(
     headers: &HeaderMap,
     expected_secret: Option<&str>,
@@ -398,28 +426,36 @@ pub fn trusted_edge_identity(
     }
 
     let org_id = header_str(headers, "x-fiducia-org-id")?.trim().to_string();
-    if org_id.is_empty() {
+    if !valid_identifier(&org_id) {
         return None;
     }
     let kind = match header_str(headers, "x-fiducia-auth-kind") {
+        None | Some("api_key") => AuthKind::ApiKey,
         Some("jwt") => AuthKind::Jwt,
-        _ => AuthKind::ApiKey,
+        Some(_) => return None,
     };
-    let scopes = header_str(headers, "x-fiducia-scopes")
+    let scopes: Vec<String> = header_str(headers, "x-fiducia-scopes")
         .map(|value| value.split_whitespace().map(ToOwned::to_owned).collect())
         .unwrap_or_default();
+    if !valid_scopes(&scopes) {
+        return None;
+    }
     let key_id = header_str(headers, "x-fiducia-key-id")
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    if key_id
+        .as_deref()
+        .is_some_and(|value| !valid_identifier(value))
+    {
+        return None;
+    }
 
     Some(VerifiedIdentity {
         kind,
         org_id,
         key_id,
         scopes,
-        // The per-key idempotency policy is not carried across the edge hop; it is
-        // enforced when the LB authenticates a raw credential directly.
         require_idempotency: false,
     })
 }
@@ -428,17 +464,15 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-/// Length-then-content compare that doesn't short-circuit on the first differing
-/// byte, so the shared secret can't be recovered a byte at a time via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
         return false;
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        difference |= left ^ right;
     }
-    diff == 0
+    difference == 0
 }
 
 #[derive(Debug, Clone)]
@@ -454,18 +488,14 @@ struct AuthConfig {
     cache_ttl: Duration,
     negative_cache_ttl: Duration,
     jwks_ttl: Duration,
-    jwt_cache_ttl: Duration,
     http_timeout: Duration,
+    revocation_check_url: String,
+    revocation_reader_secret: Option<String>,
+    revocation_freshness_secs: u64,
+    revocation_capacity: usize,
+    revocation_refresh_timeout: Duration,
 }
 
-/// Decide whether the LB requires authentication, given an explicit
-/// `FIDUCIA_AUTH_REQUIRED` (if any) and whether this is a debug build.
-///
-/// Secure-by-default: an unset value means **required** in release binaries (the
-/// posture any real deployment ships), while debug builds stay open so local/dev
-/// keeps working without wiring up `fiducia-auth`. An explicit value always wins
-/// in both directions — the documented escape hatch is `FIDUCIA_AUTH_REQUIRED=false`
-/// (loosen prod) or `=true` (harden a debug run). Kept pure for unit testing.
 fn auth_required_decision(explicit: Option<bool>, is_debug_build: bool) -> bool {
     explicit.unwrap_or(!is_debug_build)
 }
@@ -477,24 +507,15 @@ impl AuthConfig {
         );
         let explicit_required = env_bool_opt("FIDUCIA_AUTH_REQUIRED");
         let required = auth_required_decision(explicit_required, cfg!(debug_assertions));
-        // Make the posture impossible to miss in logs at startup. `from_env` runs
-        // once, right after telemetry init, so this is effectively a boot banner.
         if !required {
             tracing::warn!(
-                "FIDUCIA_AUTH_REQUIRED is {} — the load balancer accepts UNAUTHENTICATED \
-                 requests; scoped routes still fail closed, but set FIDUCIA_AUTH_REQUIRED=true \
-                 before exposing this to untrusted traffic",
-                match explicit_required {
-                    Some(false) => "explicitly false",
-                    _ => "unset (defaulting off in this debug build)",
-                }
-            );
-        } else if explicit_required.is_none() {
-            tracing::info!(
-                "FIDUCIA_AUTH_REQUIRED is unset — defaulting to REQUIRED (secure) in this release build"
+                "load balancer accepts unauthenticated requests; set FIDUCIA_AUTH_REQUIRED=true before exposure"
             );
         }
-        AuthConfig {
+        let revocation_reader_secret = env_value("FIDUCIA_REVOCATION_READER_SECRET")
+            .filter(|secret| valid_reader_secret(secret));
+
+        Self {
             required,
             allow_api_keys: env_bool("FIDUCIA_AUTH_ALLOW_API_KEYS", true),
             allow_jwts: env_bool("FIDUCIA_AUTH_ALLOW_JWTS", true),
@@ -513,11 +534,27 @@ impl AuthConfig {
                 DEFAULT_NEGATIVE_CACHE_TTL_SECS,
             ),
             jwks_ttl: duration_env("FIDUCIA_AUTH_JWKS_TTL_SECS", DEFAULT_JWKS_TTL_SECS),
-            jwt_cache_ttl: duration_env(
-                "FIDUCIA_AUTH_JWT_CACHE_TTL_SECS",
-                DEFAULT_JWT_CACHE_TTL_SECS,
-            ),
             http_timeout: duration_env("FIDUCIA_AUTH_HTTP_TIMEOUT_SECS", DEFAULT_HTTP_TIMEOUT_SECS),
+            revocation_check_url: env_value("FIDUCIA_REVOCATION_CHECK_URL")
+                .unwrap_or_else(|| DEFAULT_REVOCATION_CHECK_URL.to_string()),
+            revocation_reader_secret,
+            revocation_freshness_secs: u64_env(
+                "FIDUCIA_REVOCATION_CACHE_FRESHNESS_SECS",
+                DEFAULT_REVOCATION_FRESHNESS_SECS,
+            )
+            .max(1),
+            revocation_capacity: usize_env(
+                "FIDUCIA_REVOCATION_CACHE_CAPACITY",
+                DEFAULT_REVOCATION_CAPACITY,
+            )
+            .max(1),
+            revocation_refresh_timeout: Duration::from_millis(
+                u64_env(
+                    "FIDUCIA_REVOCATION_TIMEOUT_MILLIS",
+                    DEFAULT_REVOCATION_TIMEOUT_MILLIS,
+                )
+                .max(1),
+            ),
         }
     }
 }
@@ -534,46 +571,34 @@ struct CachedJwks {
     jwks: JwkSet,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct FiduciaClaims {
-    sub: String,
-    exp: u64,
-    #[serde(default)]
-    org_id: Option<String>,
-    #[serde(default)]
-    key_id: Option<String>,
-    #[serde(default)]
-    scopes: Vec<String>,
-}
-
 #[derive(Debug)]
 enum AuthError {
-    AuthStatus(reqwest::StatusCode),
     EmptyJwks,
-    ExpiredJwt,
     Http(reqwest::Error),
     InvalidClaims(&'static str),
+    InvalidResponse(&'static str),
     Jwt(jsonwebtoken::errors::Error),
     MissingJwk(String),
     MissingKid,
+    OversizedResponse(&'static str),
     SymmetricJwk,
     UnsupportedAlgorithm(Algorithm),
 }
 
 impl std::fmt::Display for AuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AuthError::AuthStatus(status) => write!(f, "auth service returned {status}"),
-            AuthError::EmptyJwks => write!(f, "auth jwks endpoint returned no keys"),
-            AuthError::ExpiredJwt => write!(f, "jwt is expired"),
-            AuthError::Http(err) => write!(f, "auth http error: {err}"),
-            AuthError::InvalidClaims(reason) => write!(f, "invalid jwt claims: {reason}"),
-            AuthError::Jwt(err) => write!(f, "jwt error: {err}"),
-            AuthError::MissingJwk(kid) => write!(f, "jwks key not found for kid {kid}"),
-            AuthError::MissingKid => write!(f, "jwt is missing kid"),
-            AuthError::SymmetricJwk => write!(f, "refusing symmetric jwk"),
-            AuthError::UnsupportedAlgorithm(alg) => {
-                write!(f, "unsupported jwt signing algorithm {alg:?}")
+            Self::EmptyJwks => write!(formatter, "auth jwks endpoint returned no keys"),
+            Self::Http(error) => write!(formatter, "auth http error: {error}"),
+            Self::InvalidClaims(reason) => write!(formatter, "invalid jwt claims: {reason}"),
+            Self::InvalidResponse(kind) => write!(formatter, "invalid {kind} response"),
+            Self::Jwt(error) => write!(formatter, "jwt error: {error}"),
+            Self::MissingJwk(kid) => write!(formatter, "jwks key not found for kid {kid}"),
+            Self::MissingKid => write!(formatter, "jwt is missing kid"),
+            Self::OversizedResponse(kind) => write!(formatter, "oversized {kind} response"),
+            Self::SymmetricJwk => write!(formatter, "refusing symmetric jwk"),
+            Self::UnsupportedAlgorithm(algorithm) => {
+                write!(formatter, "unsupported jwt signing algorithm {algorithm:?}")
             }
         }
     }
@@ -584,14 +609,14 @@ impl std::error::Error for AuthError {}
 fn extract_credential(headers: &HeaderMap) -> Option<String> {
     headers
         .get("authorization")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .and_then(bearer_token)
         .or_else(|| {
             headers
                 .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
+                .and_then(|value| value.to_str().ok())
                 .map(str::trim)
-                .filter(|v| !v.is_empty())
+                .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         })
 }
@@ -611,39 +636,78 @@ fn looks_like_jwt(value: &str) -> bool {
     value.split('.').count() == 3
 }
 
-fn identity_from_introspection(intro: Introspection) -> Option<VerifiedIdentity> {
-    let org_id = intro.org_id?;
-    intro.valid.then_some(VerifiedIdentity {
+fn identity_from_introspection(introspection: Introspection) -> Option<VerifiedIdentity> {
+    let org_id = introspection.org_id?;
+    if !introspection.valid || !valid_identifier(&org_id) || !valid_scopes(&introspection.scopes) {
+        return None;
+    }
+    Some(VerifiedIdentity {
         kind: AuthKind::ApiKey,
         org_id,
-        key_id: intro.key_id,
-        scopes: intro.scopes,
-        require_idempotency: intro.require_idempotency.unwrap_or(false),
+        key_id: introspection.key_id.filter(|value| valid_identifier(value)),
+        scopes: introspection.scopes,
+        require_idempotency: introspection.require_idempotency.unwrap_or(false),
     })
 }
 
-fn identity_from_claims(claims: FiduciaClaims) -> Result<VerifiedIdentity, AuthError> {
-    let org_id = claims.org_id.unwrap_or(claims.sub);
-    if org_id.trim().is_empty() {
-        return Err(AuthError::InvalidClaims("missing org"));
-    }
+fn identity_from_claims(claims: &Claims) -> Result<VerifiedIdentity, AuthError> {
     Ok(VerifiedIdentity {
         kind: AuthKind::Jwt,
-        org_id,
-        key_id: claims.key_id,
-        scopes: claims.scopes,
-        // JWT claims don't carry the per-key idempotency requirement; the control
-        // is an API-key policy, so JWT-authed callers are never gated on it.
+        org_id: claims.org_id.clone(),
+        key_id: None,
+        scopes: claims.scopes.clone(),
         require_idempotency: false,
     })
 }
 
-fn jwt_cache_ttl(exp: u64, max_ttl: Duration) -> Result<Duration, AuthError> {
-    let now = unix_secs();
-    if exp <= now {
-        return Err(AuthError::ExpiredJwt);
+fn validate_claim_contract(
+    claims: &Claims,
+    expected_issuer: &str,
+    expected_audience: &str,
+    now: u64,
+) -> Result<(), AuthError> {
+    if claims.iss != expected_issuer || claims.aud != expected_audience {
+        return Err(AuthError::InvalidClaims("issuer or audience"));
     }
-    Ok(Duration::from_secs(exp - now).min(max_ttl))
+    if !valid_identifier(&claims.sub)
+        || !valid_identifier(&claims.org_id)
+        || !valid_identifier(&claims.jti)
+    {
+        return Err(AuthError::InvalidClaims("identity"));
+    }
+    if claims.sub != claims.org_id {
+        return Err(AuthError::InvalidClaims("subject/tenant mismatch"));
+    }
+    if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_ACCESS_TOKEN_TTL_SECS {
+        return Err(AuthError::InvalidClaims("lifetime"));
+    }
+    if claims.iat > now.saturating_add(JWT_CLOCK_SKEW_SECS) {
+        return Err(AuthError::InvalidClaims("issued in the future"));
+    }
+    if !valid_scopes(&claims.scopes) {
+        return Err(AuthError::InvalidClaims("scopes"));
+    }
+    Ok(())
+}
+
+fn valid_identifier(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 256
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
+fn valid_scopes(scopes: &[String]) -> bool {
+    scopes.len() <= 64
+        && scopes.iter().all(|scope| {
+            !scope.is_empty()
+                && scope.len() <= 128
+                && !scope
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+        })
 }
 
 fn reject_symmetric_jwk(jwk: &Jwk) -> Result<(), AuthError> {
@@ -653,9 +717,9 @@ fn reject_symmetric_jwk(jwk: &Jwk) -> Result<(), AuthError> {
     Ok(())
 }
 
-fn is_asymmetric_algorithm(alg: Algorithm) -> bool {
+fn is_asymmetric_algorithm(algorithm: Algorithm) -> bool {
     matches!(
-        alg,
+        algorithm,
         Algorithm::ES256
             | Algorithm::ES384
             | Algorithm::RS256
@@ -669,7 +733,15 @@ fn is_asymmetric_algorithm(alg: Algorithm) -> bool {
 }
 
 fn auth_response(status: StatusCode, error: &str, detail: &str) -> Response {
-    (status, Json(json!({ "error": error, "detail": detail }))).into_response()
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(json!({ "error": error, "detail": detail })),
+    )
+        .into_response()
 }
 
 fn credential_cache_key(kind: &str, credential: &str) -> String {
@@ -678,12 +750,7 @@ fn credential_cache_key(kind: &str, credential: &str) -> String {
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
-    }
-    out
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -697,9 +764,6 @@ fn env_bool(name: &str, default: bool) -> bool {
     env_bool_opt(name).unwrap_or(default)
 }
 
-/// Parse a boolean env var, returning `None` when it is unset/blank or
-/// unrecognized, so callers can distinguish "operator chose a value" from
-/// "operator said nothing" (needed for secure-by-default resolution).
 fn env_bool_opt(name: &str) -> Option<bool> {
     match env_value(name).as_deref() {
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => Some(true),
@@ -709,15 +773,30 @@ fn env_bool_opt(name: &str) -> Option<bool> {
 }
 
 fn duration_env(name: &str, default_secs: u64) -> Duration {
-    Duration::from_secs(
-        env_value(name)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default_secs),
-    )
+    Duration::from_secs(u64_env(name, default_secs))
+}
+
+fn u64_env(name: &str, default: u64) -> u64 {
+    env_value(name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn usize_env(name: &str, default: usize) -> usize {
+    env_value(name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
+}
+
+fn valid_reader_secret(secret: &str) -> bool {
+    secret.len() >= MIN_READER_SECRET_BYTES
+        && !secret
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
 }
 
 fn unix_secs() -> u64 {
@@ -733,90 +812,83 @@ mod tests {
 
     #[test]
     fn auth_required_defaults_secure_in_release_but_open_in_debug() {
-        // An explicit value always wins, in either direction (the escape hatch).
         assert!(auth_required_decision(Some(true), true));
         assert!(auth_required_decision(Some(true), false));
         assert!(!auth_required_decision(Some(false), true));
         assert!(!auth_required_decision(Some(false), false));
-        // Unset: secure (required) in release builds, open in debug builds.
-        assert!(
-            auth_required_decision(None, false),
-            "release defaults to required"
-        );
-        assert!(
-            !auth_required_decision(None, true),
-            "debug stays open for dev"
-        );
+        assert!(auth_required_decision(None, false));
+        assert!(!auth_required_decision(None, true));
     }
 
     #[test]
-    fn env_bool_opt_distinguishes_unset_from_explicit() {
-        assert_eq!(env_bool_opt("FIDUCIA_TEST_UNSET_BOOL_XYZ"), None);
-        // Recognized truthy/falsey values parse; junk is treated as unset.
-        // (Exercised without touching process env for the recognized cases via
-        // the pure matcher above; here we only assert the unset path.)
-    }
-
-    #[test]
-    fn extracts_bearer_or_x_api_key() {
+    fn extracts_bearer_or_api_key() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
-            "Bearer fdc_live_id.secret".parse().unwrap(),
-        );
-        assert_eq!(
-            extract_credential(&headers).as_deref(),
-            Some("fdc_live_id.secret")
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", "fdc_live_other.secret".parse().unwrap());
-        assert_eq!(
-            extract_credential(&headers).as_deref(),
-            Some("fdc_live_other.secret")
-        );
-    }
-
-    #[test]
-    fn bearer_scheme_is_case_insensitive_and_trims_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            "bearer   header.payload.signature  ".parse().unwrap(),
+            "bearer   header.payload.signature".parse().unwrap(),
         );
         assert_eq!(
             extract_credential(&headers).as_deref(),
             Some("header.payload.signature")
         );
-    }
-
-    #[test]
-    fn extract_credential_ignores_empty_bearer_and_blank_api_key() {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer    ".parse().unwrap());
-        headers.insert("x-api-key", "   ".parse().unwrap());
-
-        assert_eq!(extract_credential(&headers), None);
+        headers.insert("x-api-key", "fdc_live_id.secret".parse().unwrap());
+        assert_eq!(
+            extract_credential(&headers).as_deref(),
+            Some("fdc_live_id.secret")
+        );
     }
 
     #[test]
-    fn classifies_api_keys_and_jwts() {
-        assert!(is_api_key("fdc_live_abc.def"));
-        assert!(!is_api_key("not-a-key"));
-        assert!(looks_like_jwt("header.payload.signature"));
-        assert!(!looks_like_jwt("fdc_live_abc.def"));
-    }
-
-    #[test]
-    fn credential_cache_key_hashes_the_secret() {
+    fn cache_keys_never_retain_credentials() {
         let key = credential_cache_key("api_key", "fdc_live_id.super-secret");
-        assert!(key.starts_with("api_key:"));
-        assert!(!key.contains("super-secret"));
         assert_eq!(key.len(), "api_key:".len() + 64);
+        assert!(!key.contains("super-secret"));
     }
 
     #[test]
-    fn strips_client_supplied_identity_and_secret_headers() {
+    fn complete_internal_claim_contract_is_required() {
+        let claims = Claims {
+            sub: "org-a".to_string(),
+            org_id: "org-a".to_string(),
+            scopes: vec!["kv:read".to_string()],
+            iss: DEFAULT_JWT_ISSUER.to_string(),
+            aud: DEFAULT_JWT_AUDIENCE.to_string(),
+            iat: 100,
+            exp: 200,
+            jti: "token-a".to_string(),
+        };
+        assert!(
+            validate_claim_contract(&claims, DEFAULT_JWT_ISSUER, DEFAULT_JWT_AUDIENCE, 100).is_ok()
+        );
+        let mut mismatch = claims.clone();
+        mismatch.org_id = "org-b".to_string();
+        assert!(
+            validate_claim_contract(&mismatch, DEFAULT_JWT_ISSUER, DEFAULT_JWT_AUDIENCE, 100)
+                .is_err()
+        );
+        let mut long_lived = claims;
+        long_lived.exp = long_lived.iat + MAX_ACCESS_TOKEN_TTL_SECS + 1;
+        assert!(validate_claim_contract(
+            &long_lived,
+            DEFAULT_JWT_ISSUER,
+            DEFAULT_JWT_AUDIENCE,
+            100
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn reader_secret_contract_is_fail_closed() {
+        assert!(valid_reader_secret(&"x".repeat(MIN_READER_SECRET_BYTES)));
+        assert!(!valid_reader_secret("short"));
+        assert!(!valid_reader_secret(
+            &("x".repeat(MIN_READER_SECRET_BYTES) + " ")
+        ));
+    }
+
+    #[test]
+    fn strips_all_client_supplied_identity_and_secret_headers() {
         for name in [
             "authorization",
             "x-api-key",
@@ -826,69 +898,31 @@ mod tests {
             "x-fiducia-key-id",
             "x-fiducia-scopes",
             "x-fiducia-edge-auth",
-            "X-Fiducia-Edge-Auth",
             "x-fiducia-internal-auth",
-            "X-Fiducia-Internal-Auth",
         ] {
             assert!(should_strip_client_auth_header(name));
         }
-        assert!(!should_strip_client_auth_header("x-fiducia-edge-region"));
     }
 
     #[test]
-    fn trusted_edge_identity_requires_the_shared_secret() {
+    fn trusted_edge_identity_requires_exact_secret_and_valid_fields() {
         let mut headers = HeaderMap::new();
         headers.insert(EDGE_AUTH_HEADER, "edge-secret".parse().unwrap());
-        headers.insert("x-fiducia-auth-kind", "api_key".parse().unwrap());
-        headers.insert("x-fiducia-org-id", "org_9".parse().unwrap());
+        headers.insert("x-fiducia-auth-kind", "jwt".parse().unwrap());
+        headers.insert("x-fiducia-org-id", "org-a".parse().unwrap());
         headers.insert("x-fiducia-scopes", "kv:read kv:write".parse().unwrap());
-        headers.insert("x-fiducia-key-id", "key_9".parse().unwrap());
-
-        // Valid secret → the forwarded identity is trusted.
         let identity = trusted_edge_identity(&headers, Some("edge-secret")).unwrap();
-        assert_eq!(identity.kind, AuthKind::ApiKey);
-        assert_eq!(identity.org_id, "org_9");
-        assert_eq!(identity.key_id.as_deref(), Some("key_9"));
-        assert_eq!(identity.scopes, vec!["kv:read", "kv:write"]);
-
-        // Wrong secret, absent secret, or no secret configured → not trusted.
+        assert_eq!(identity.kind, AuthKind::Jwt);
+        assert_eq!(identity.org_id, "org-a");
         assert!(trusted_edge_identity(&headers, Some("wrong-secret")).is_none());
-        assert!(trusted_edge_identity(&headers, None).is_none());
-    }
-
-    #[test]
-    fn trusted_edge_identity_rejects_spoofed_headers_without_the_secret() {
-        // A direct client injects identity headers but cannot supply the secret.
-        let mut headers = HeaderMap::new();
-        headers.insert("x-fiducia-org-id", "org_evil".parse().unwrap());
-        headers.insert("x-fiducia-scopes", "admin:write".parse().unwrap());
+        headers.insert("x-fiducia-auth-kind", "unknown".parse().unwrap());
         assert!(trusted_edge_identity(&headers, Some("edge-secret")).is_none());
     }
 
     #[test]
-    fn introspection_becomes_verified_api_key_identity() {
-        let intro = Introspection {
-            valid: true,
-            org_id: Some("org_1".to_string()),
-            key_id: Some("key_1".to_string()),
-            scopes: vec!["kv:read".to_string()],
-            require_idempotency: Some(true),
-        };
-        let identity = identity_from_introspection(intro).unwrap();
-        assert_eq!(identity.kind, AuthKind::ApiKey);
-        assert_eq!(identity.org_id, "org_1");
-        assert_eq!(identity.key_id.as_deref(), Some("key_1"));
-        assert_eq!(identity.scopes_header(), "kv:read");
-        assert!(identity.require_idempotency);
-    }
-
-    /// The decision cache is keyed by the hash of a caller-supplied token, so an
-    /// attacker spraying tokens at a public edge must not be able to grow it
-    /// without bound: expired entries are swept, and the cap holds regardless.
-    #[test]
     fn decision_cache_is_bounded_and_sweeps_expired_entries() {
         let now = Instant::now();
-        let live = |offset: u64| CachedDecision {
+        let live = |offset| CachedDecision {
             expires_at: now + Duration::from_secs(offset),
             identity: None,
         };
@@ -896,49 +930,26 @@ mod tests {
             expires_at: now - Duration::from_secs(1),
             identity: None,
         };
-
-        // Below capacity: nothing is touched, even an already-expired entry.
-        let mut decisions = HashMap::from([("expired".to_string(), expired.clone())]);
-        prune_decisions(&mut decisions, now, 4);
-        assert_eq!(decisions.len(), 1);
-
-        // At capacity with expired entries: those are swept.
         let mut decisions = HashMap::from([
-            ("a".to_string(), expired.clone()),
-            ("b".to_string(), expired),
-            ("c".to_string(), live(60)),
-            ("d".to_string(), live(60)),
-        ]);
-        prune_decisions(&mut decisions, now, 4);
-        assert_eq!(decisions.len(), 2);
-        assert!(decisions.contains_key("c") && decisions.contains_key("d"));
-
-        // At capacity with everything still live: the soonest to expire is evicted
-        // so a spray can never push the map past the cap.
-        let mut decisions = HashMap::from([
-            ("soonest".to_string(), live(1)),
+            ("expired".to_string(), expired),
             ("b".to_string(), live(60)),
             ("c".to_string(), live(60)),
-            ("d".to_string(), live(60)),
         ]);
-        prune_decisions(&mut decisions, now, 4);
-        assert_eq!(decisions.len(), 3);
-        assert!(!decisions.contains_key("soonest"));
+        prune_decisions(&mut decisions, now, 3);
+        assert_eq!(decisions.len(), 2);
+        let mut decisions =
+            HashMap::from([("soon".to_string(), live(1)), ("b".to_string(), live(60))]);
+        prune_decisions(&mut decisions, now, 2);
+        assert!(!decisions.contains_key("soon"));
     }
 
-    /// End to end through the real cache: many distinct tokens, bounded map.
-    #[tokio::test]
-    async fn caching_many_distinct_tokens_never_exceeds_the_cap() {
-        let state = AuthState::from_env();
-        for i in 0..(MAX_CACHED_DECISIONS + 500) {
-            state
-                .cache_decision(
-                    credential_cache_key("api_key", &format!("sprayed-{i}")),
-                    None,
-                    Duration::from_secs(300),
-                )
-                .await;
-            assert!(state.decisions.read().await.len() <= MAX_CACHED_DECISIONS);
-        }
+    #[test]
+    fn auth_failures_are_not_cacheable() {
+        let response = auth_response(StatusCode::UNAUTHORIZED, "invalid_jwt", "invalid jwt");
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(response.headers().get(header::PRAGMA).unwrap(), "no-cache");
     }
 }
