@@ -983,10 +983,7 @@ mod tests {
             "x-fiducia-key-id",
         ] {
             let mut headers = trusted_edge_headers();
-            headers.insert(
-                name,
-                axum::http::HeaderValue::from_bytes(&[0x80]).unwrap(),
-            );
+            headers.insert(name, axum::http::HeaderValue::from_bytes(&[0x80]).unwrap());
             assert!(
                 trusted_edge_identity(&headers, Some("edge-secret")).is_none(),
                 "non-UTF-8 trusted header must be rejected: {name}"
