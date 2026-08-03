@@ -144,9 +144,7 @@ async fn complete_snapshot_refreshes_over_http_and_authenticates_both_requests()
     );
     assert!(table.is_hydrated());
     assert_eq!(
-        table
-            .validate_node_hint("http://10.0.0.1:8090")
-            .as_deref(),
+        table.validate_node_hint("http://10.0.0.1:8090").as_deref(),
         Some("http://10.0.0.1:8090")
     );
     assert_eq!(table.validate_node_hint("http://unknown:8090"), None);
