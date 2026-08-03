@@ -136,12 +136,20 @@ async fn complete_snapshot_refreshes_over_http_and_authenticates_both_requests()
     let table = table::RouteTable::new(2, vec![]);
     table.refresh_from_brain(&brain_url).await;
 
+    assert_eq!(table.shard_count(), 2);
     assert_eq!(table.leader_for(0).as_deref(), Some("http://10.0.0.1:8090"));
     assert_eq!(
         table.leader_for(1).as_deref(),
         Some("https://10.0.0.2:8443")
     );
     assert!(table.is_hydrated());
+    assert_eq!(
+        table
+            .validate_node_hint("http://10.0.0.1:8090")
+            .as_deref(),
+        Some("http://10.0.0.1:8090")
+    );
+    assert_eq!(table.validate_node_hint("http://unknown:8090"), None);
 
     let snapshot = table.snapshot();
     assert_eq!(
