@@ -420,27 +420,30 @@ pub fn trusted_edge_identity(
     expected_secret: Option<&str>,
 ) -> Option<VerifiedIdentity> {
     let expected = expected_secret?;
-    let provided = header_str(headers, EDGE_AUTH_HEADER)?;
+    let provided = unique_header_str(headers, EDGE_AUTH_HEADER).flatten()?;
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
         return None;
     }
 
-    let org_id = header_str(headers, "x-fiducia-org-id")?.trim().to_string();
+    let org_id = unique_header_str(headers, "x-fiducia-org-id")
+        .flatten()?
+        .trim()
+        .to_string();
     if !valid_identifier(&org_id) {
         return None;
     }
-    let kind = match header_str(headers, "x-fiducia-auth-kind") {
+    let kind = match unique_header_str(headers, "x-fiducia-auth-kind")? {
         None | Some("api_key") => AuthKind::ApiKey,
         Some("jwt") => AuthKind::Jwt,
         Some(_) => return None,
     };
-    let scopes: Vec<String> = header_str(headers, "x-fiducia-scopes")
+    let scopes: Vec<String> = unique_header_str(headers, "x-fiducia-scopes")?
         .map(|value| value.split_whitespace().map(ToOwned::to_owned).collect())
         .unwrap_or_default();
     if !valid_scopes(&scopes) {
         return None;
     }
-    let key_id = header_str(headers, "x-fiducia-key-id")
+    let key_id = unique_header_str(headers, "x-fiducia-key-id")?
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
@@ -460,8 +463,18 @@ pub fn trusted_edge_identity(
     })
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
+// Trusted-hop identity headers are a security boundary, not a comma-joinable
+// list. Distinguish absent from exactly one valid value and reject both invalid
+// encoding and every duplicate, including identical duplicates.
+fn unique_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<Option<&'a str>> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Some(None);
+    };
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().map(Some)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -810,6 +823,31 @@ fn unix_secs() -> u64 {
 mod tests {
     use super::*;
 
+    fn trusted_edge_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(EDGE_AUTH_HEADER, "edge-secret".parse().unwrap());
+        headers.insert("x-fiducia-auth-kind", "jwt".parse().unwrap());
+        headers.insert("x-fiducia-org-id", "org-a".parse().unwrap());
+        headers.insert("x-fiducia-scopes", "kv:read kv:write".parse().unwrap());
+        headers.insert("x-fiducia-key-id", "key-a".parse().unwrap());
+        headers
+    }
+
+    fn assert_duplicate_trusted_header_rejected(
+        name: &'static str,
+        first: &'static str,
+        second: &'static str,
+    ) {
+        let mut headers = trusted_edge_headers();
+        headers.remove(name);
+        headers.append(name, first.parse().unwrap());
+        headers.append(name, second.parse().unwrap());
+        assert!(
+            trusted_edge_identity(&headers, Some("edge-secret")).is_none(),
+            "duplicate trusted header must be rejected: {name}"
+        );
+    }
+
     #[test]
     fn auth_required_defaults_secure_in_release_but_open_in_debug() {
         assert!(auth_required_decision(Some(true), true));
@@ -906,17 +944,54 @@ mod tests {
 
     #[test]
     fn trusted_edge_identity_requires_exact_secret_and_valid_fields() {
-        let mut headers = HeaderMap::new();
-        headers.insert(EDGE_AUTH_HEADER, "edge-secret".parse().unwrap());
-        headers.insert("x-fiducia-auth-kind", "jwt".parse().unwrap());
-        headers.insert("x-fiducia-org-id", "org-a".parse().unwrap());
-        headers.insert("x-fiducia-scopes", "kv:read kv:write".parse().unwrap());
+        let mut headers = trusted_edge_headers();
         let identity = trusted_edge_identity(&headers, Some("edge-secret")).unwrap();
         assert_eq!(identity.kind, AuthKind::Jwt);
         assert_eq!(identity.org_id, "org-a");
+        assert_eq!(identity.key_id.as_deref(), Some("key-a"));
+        assert_eq!(identity.scopes, ["kv:read", "kv:write"]);
         assert!(trusted_edge_identity(&headers, Some("wrong-secret")).is_none());
         headers.insert("x-fiducia-auth-kind", "unknown".parse().unwrap());
         assert!(trusted_edge_identity(&headers, Some("edge-secret")).is_none());
+    }
+
+    #[test]
+    fn trusted_edge_identity_rejects_every_duplicate_identity_header() {
+        for (name, first, second) in [
+            (EDGE_AUTH_HEADER, "edge-secret", "edge-secret"),
+            ("x-fiducia-org-id", "org-a", "org-a"),
+            ("x-fiducia-auth-kind", "jwt", "api_key"),
+            (
+                "x-fiducia-scopes",
+                "admin:write kv:write",
+                "kv:write admin:write",
+            ),
+            ("x-fiducia-scopes", "admin:write", "admin:write"),
+            ("x-fiducia-key-id", "key-a", "key-b"),
+        ] {
+            assert_duplicate_trusted_header_rejected(name, first, second);
+        }
+    }
+
+    #[test]
+    fn trusted_edge_identity_rejects_non_utf8_identity_headers() {
+        for name in [
+            EDGE_AUTH_HEADER,
+            "x-fiducia-org-id",
+            "x-fiducia-auth-kind",
+            "x-fiducia-scopes",
+            "x-fiducia-key-id",
+        ] {
+            let mut headers = trusted_edge_headers();
+            headers.insert(
+                name,
+                axum::http::HeaderValue::from_bytes(&[0x80]).unwrap(),
+            );
+            assert!(
+                trusted_edge_identity(&headers, Some("edge-secret")).is_none(),
+                "non-UTF-8 trusted header must be rejected: {name}"
+            );
+        }
     }
 
     #[test]
