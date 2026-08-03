@@ -41,18 +41,12 @@ struct BrainFixture {
     requests: Arc<Mutex<Vec<RequestObservation>>>,
 }
 
-async fn nodes_handler(
-    State(state): State<BrainFixture>,
-    headers: HeaderMap,
-) -> Json<Value> {
+async fn nodes_handler(State(state): State<BrainFixture>, headers: HeaderMap) -> Json<Value> {
     observe(&state, "/v1/nodes", &headers);
     Json(state.nodes)
 }
 
-async fn placement_handler(
-    State(state): State<BrainFixture>,
-    headers: HeaderMap,
-) -> Json<Value> {
+async fn placement_handler(State(state): State<BrainFixture>, headers: HeaderMap) -> Json<Value> {
     observe(&state, "/v1/placement", &headers);
     Json(state.placement)
 }
