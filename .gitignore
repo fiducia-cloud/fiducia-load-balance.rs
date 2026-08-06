@@ -9,3 +9,7 @@
 
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
