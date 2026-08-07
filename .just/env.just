@@ -24,6 +24,7 @@ set positional-arguments := true
 _enc := justfile_directory() / "env" / "enc"
 _dec := justfile_directory() / "env" / "dec"
 _fmt := "--input-type dotenv --output-type dotenv"
+_dotenv := "python3 " + justfile_directory() / ".just" / "dotenv.py"
 
 # List every environment and the variable names it defines (never values).
 [group('env')]
@@ -124,27 +125,12 @@ env-run name +cmd:
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
     [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
-    # Deliberately NOT `sops exec-env`: it treats the raw dotenv value as
-    # opaque, so DQ="hello world" is exported with the quote characters still
-    # attached, while every app-side dotenv library strips them. Parse it here
-    # with the ordinary dotenv rules instead, so `just env-run` and an app
-    # reading env/dec/<name>.env see byte-identical values.
-    #   "…"  quotes stripped, \n \t \r \\ expanded
-    #   '…'  quotes stripped, contents literal
-    #   …    taken literally, spaces and all
-    # The plaintext only ever exists in this process's memory and the child's
-    # environment — nothing is written to disk.
-    eval "$(sops decrypt {{ _fmt }} "$src" | while IFS= read -r line || [[ -n $line ]]; do
-      [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
-      line=${line#export }
-      [[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-      k=${BASH_REMATCH[1]}; v=${BASH_REMATCH[2]}
-      [[ $k == sops_* ]] && continue
-      if [[ ${#v} -ge 2 && $v == \"*\" ]]; then v=$(printf '%b' "${v:1:${#v}-2}")
-      elif [[ ${#v} -ge 2 && $v == \'*\' ]]; then v=${v:1:${#v}-2}
-      fi
-      printf 'export %s=%q\n' "$k" "$v"
-    done)"
+    # Deliberately NOT `sops exec-env`: it shells out to /bin/sh, and it treats
+    # the raw dotenv value as opaque so DQ="hello world" keeps its quotes.
+    # .just/dotenv.py applies the ordinary dotenv rules once, so every consumer
+    # (here, docker, kubernetes) sees byte-identical values.
+    # Plaintext exists only in this process's memory and the child's env.
+    eval "$(sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} shell)"
     shift          # drop the environment name; "$@" is now the command
     exec "$@"
 
@@ -297,3 +283,73 @@ env-clean:
       n=$((n+1))
     done
     echo "removed $n decrypted file(s) from env/dec/"
+
+# ─── containers ─────────────────────────────────────────────────────────────
+#
+# Decryption happens at RUN time, never at build time. A secret decrypted during
+# `docker build` is written into an image layer and stays there — a later
+# `RUN rm` does not remove it, and `--build-arg` is worse still because it lands
+# in `docker history`.
+#
+# Unlike the sonus-auris/ores-sops container pattern, nothing is baked into the
+# image here: no sops binary, no ciphertext, no entrypoint script. That is not a
+# style preference — `sops exec-env` shells out to /bin/sh in BOTH modes
+# (`--same-process` included; measured, it fails on a valid single-word binary
+# path), and most fiducia services run on gcr.io/distroless/cc-debian12, which
+# has no shell. Decrypting host-side and injecting with --env-file is the only
+# form that works on distroless, and it leaves the application as PID 1 so
+# SIGTERM reaches it directly and it can drain on `docker stop`.
+#
+# Trade-off, stated plainly: --env-file values are visible in `docker inspect`.
+# The in-image alternative instead exposes SOPS_AGE_KEY there — a key that
+# decrypts every environment — so this is the smaller leak, not a free win.
+# For real deployments use `env-k8s-secret` (below) or a platform secret store.
+
+# Run a container with <name>'s variables injected. Image needs no sops/shell.
+[group('docker')]
+env-docker-run name image *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
+    shift 2   # drop <name> and <image>; "$@" is the container command
+    # Materialise and validate BEFORE invoking docker. Inlining this as a
+    # process substitution fails open: if the pipeline errors, docker still
+    # receives a truncated env-file and cheerfully starts the container without
+    # its secrets. `set -e` on the assignment turns that into a hard stop.
+    envdata=$(sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile)
+    # The plaintext is a pipe the docker CLI reads; it never reaches the disk.
+    exec docker run --rm \
+      --env-file <(printf '%s\n' "$envdata") \
+      {{ image }} "$@"
+
+# Materialise a 0600 env-file for `docker compose` (env_file:) — plaintext on disk.
+[group('docker')]
+env-docker-env-file name:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    mkdir -p {{ _dec }} && chmod 700 {{ _dec }}
+    out={{ _dec }}/{{ name }}.env
+    tmp=$(mktemp "{{ _dec }}/.{{ name }}.XXXXXX"); chmod 600 "$tmp"
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile > "$tmp"; mv -f "$tmp" "$out"
+    # compose needs a real path for `env_file:`; prefer env-docker-run when the
+    # plaintext file is avoidable. Wipe it afterwards with `just env-clean`.
+    echo "$out"
+
+# Render a Kubernetes Secret from <name>. Pipe to `kubectl apply -f -` to apply.
+[group('docker')]
+env-k8s-secret name secret="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src={{ _enc }}/{{ name }}.env.enc
+    [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
+    sname="{{ secret }}"; [[ -n $sname ]] || sname="$(basename '{{ justfile_directory() }}' | tr '.' '-')-{{ name }}"
+    # --dry-run=client: this only renders YAML, it never contacts a cluster.
+    # The app container then uses `envFrom: [secretRef: {name: <sname>}]` and
+    # stays distroless — it never needs sops or the age key.
+    # Rendered directly rather than via `kubectl --from-env-file`, which is the
+    # same dotenv format and so cannot carry a multi-line value either.
+    sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} k8s "$sname"

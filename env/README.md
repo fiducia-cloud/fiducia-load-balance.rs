@@ -79,6 +79,50 @@ Two format limits, inherited from sops' dotenv parser:
   `JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIE…\n-----END PRIVATE KEY-----\n"`
 - **Blank lines are dropped** on round-trip. Cosmetic only.
 
+## Containers
+
+Decryption happens at `docker run`, **never** at `docker build`. A secret
+decrypted during a build is written into an image layer and stays there — a
+later `RUN rm` does not remove it, and `--build-arg` is worse still because it
+lands in `docker history`.
+
+```sh
+just env-docker-run local ghcr.io/fiducia-cloud/fiducia-auth:dev
+just env-k8s-secret prod | kubectl apply -f -
+```
+
+Nothing is baked into the image: no sops binary, no ciphertext, no entrypoint
+script. That is forced, not chosen. `sops exec-env` shells out to `/bin/sh` in
+**both** modes — `--same-process` included, verified against a valid
+single-word binary path — and most fiducia services run on
+`gcr.io/distroless/cc-debian12`, which deliberately has no shell. So the
+sonus-auris/ores-sops in-container entrypoint cannot run here at all.
+
+Decrypting host-side and injecting with `--env-file` also leaves the
+application as **PID 1**, so `docker stop` delivers SIGTERM straight to it and
+it can drain. Wrapping the app in sops or a shell would make it a child and
+swallow the signal.
+
+The trade-off, stated plainly: `--env-file` values are visible in
+`docker inspect`. The in-image alternative exposes `SOPS_AGE_KEY` there
+instead — a key that decrypts *every* environment — so this is the smaller
+leak, not a free win. For real deployments use `env-k8s-secret` and let the
+platform hold the secret.
+
+### Multi-line values do not fit in --env-file
+
+`docker --env-file` is one line per variable with no escape processing, so a
+value containing a newline cannot be represented: docker keeps the first line
+and silently drops the rest. `just env-docker-run` refuses rather than starting
+a container with a half-truncated key. A PEM therefore goes through
+`just env-run`, `just env-k8s-secret` (base64, no such limit), or gets stored
+single-line.
+
+All three paths share one parser (`.just/dotenv.py`) so the same encrypted file
+yields byte-identical values everywhere. Without it each loader applies its own
+quoting rules and `"-----BEGIN…\n…"` reaches the app with the quotes still
+attached.
+
 ## Rules
 
 - Never commit anything from `env/dec/`. `.gitignore` and `just env-check`
