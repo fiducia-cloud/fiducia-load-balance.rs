@@ -254,18 +254,46 @@ env-check:
         && echo "  ✓ $rule" || note "missing .gitignore rule: $rule"
     done
 
+    # Key-independent checks first, so this whole recipe is runnable in CI with
+    # no age key at all. Handing CI a decryption key just to lint would defeat
+    # the point of the audit.
     echo "ciphertext integrity:"
     shopt -s nullglob
     found=0
     for f in env/enc/*.env.enc; do
       found=1
-      if sops decrypt --input-type dotenv --output-type dotenv "$f" >/dev/null 2>&1; then
-        echo "  ✓ $f decrypts"
+      if ! grep -q 'ENC\[AES256_GCM' "$f"; then
+        note "$f is NOT sops-encrypted — it is plaintext in env/enc/"
+        continue
+      fi
+      grep -q '^sops_mac=' "$f" || note "$f has no sops MAC (truncated or hand-edited?)"
+      # Every file must keep at least two recipients. With one, losing that key
+      # makes the file permanently unreadable — sops has no backdoor.
+      r=$(grep -c 'map_recipient' "$f" || true)
+      if [[ $r -lt 2 ]]; then
+        note "$f has $r recipient(s); needs >= 2 so a lost key is survivable"
       else
-        note "$f does NOT decrypt with your key (ask for a rekey)"
+        echo "  ✓ $f encrypted, $r recipients"
       fi
     done
     [[ $found -eq 1 ]] || echo "  · no environments yet"
+
+    # Only now, and only if a key is actually present, prove it decrypts.
+    keyfile=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { keyfile=$p; break; }
+    done
+    if [[ -z $keyfile && -z ${SOPS_AGE_KEY:-} ]]; then
+      echo "  · no age key on this host — skipped decryption (fine in CI)"
+    else
+      for f in env/enc/*.env.enc; do
+        sops decrypt --input-type dotenv --output-type dotenv "$f" >/dev/null 2>&1 \
+          && echo "  ✓ $f decrypts with your key" \
+          || note "$f does NOT decrypt with your key (ask for a rekey)"
+      done
+    fi
 
     [[ $fail -eq 0 ]] && echo $'\nenv-check PASSED' || { echo $'\nenv-check FAILED'; exit 1; }
 

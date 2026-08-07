@@ -15,9 +15,16 @@
 
 keys:
   - &alex age1qrnva7lnv2jzww6ah5au0cqm4wkvkm5shpzflekdcm4nlu6wnyfqgfaxft # alex@dancingdragons.cc
+  # Offline recovery key. Exists so that losing the laptop key does not make
+  # every environment in every fiducia-cloud repo permanently unreadable —
+  # sops has no backdoor, so with one recipient a lost key is unrecoverable
+  # data loss. The private half must live OFF this machine (password manager /
+  # printed and stored physically) and is not used day to day.
+  - &recovery age1txv6jzlds2s03advmdtnm5l93qh4rkqs50nwvzk9yfvsartzue8se8t7jv # offline recovery — see env/README.md
 
 creation_rules:
   - path_regex: env/enc/.*\.env\.enc$
     key_groups:
       - age:
           - *alex
+          - *recovery
