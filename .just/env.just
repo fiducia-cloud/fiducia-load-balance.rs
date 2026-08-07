@@ -306,23 +306,25 @@ env-clean:
 # For real deployments use `env-k8s-secret` (below) or a platform secret store.
 
 # Run a container with <name>'s variables injected. Image needs no sops/shell.
+# Everything after <name> goes to `docker run` verbatim, so flags work:
+#   just env-docker-run local -p 8080:8080 --name api ghcr.io/…/fiducia-auth:dev
 [group('docker')]
-env-docker-run name image *args:
+env-docker-run name +args:
     #!/usr/bin/env bash
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
     [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
     command -v docker >/dev/null || { echo "docker not found" >&2; exit 1; }
-    shift 2   # drop <name> and <image>; "$@" is the container command
+    shift 1   # drop <name>; "$@" is everything docker run should receive
     # Materialise and validate BEFORE invoking docker. Inlining this as a
     # process substitution fails open: if the pipeline errors, docker still
     # receives a truncated env-file and cheerfully starts the container without
     # its secrets. `set -e` on the assignment turns that into a hard stop.
     envdata=$(sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile)
     # The plaintext is a pipe the docker CLI reads; it never reaches the disk.
-    exec docker run --rm \
-      --env-file <(printf '%s\n' "$envdata") \
-      {{ image }} "$@"
+    # No --rm here: the caller controls docker's flags, so `-d`, `--rm`, `-p`
+    # and friends are theirs to pass.
+    exec docker run --env-file <(printf '%s\n' "$envdata") "$@"
 
 # Materialise a 0600 env-file for `docker compose` (env_file:) — plaintext on disk.
 [group('docker')]
