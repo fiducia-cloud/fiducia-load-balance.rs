@@ -306,7 +306,10 @@ env-clean:
     n=0
     for f in {{ _dec }}/*.env; do
       # Overwrite before unlinking so the plaintext does not linger in free blocks.
-      dd if=/dev/zero of="$f" bs=1 count="$(wc -c <"$f")" conv=notrunc status=none 2>/dev/null || true
+      # NOT `dd ... status=none`: that flag is GNU-only, macOS dd rejects it, and
+      # with 2>/dev/null||true the overwrite silently never happened. `head -c`
+      # from /dev/zero behaves identically on both.
+      head -c "$(wc -c <"$f")" /dev/zero > "$f" 2>/dev/null || true
       rm -f -- "$f"
       n=$((n+1))
     done
@@ -376,10 +379,69 @@ env-k8s-secret name secret="":
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
     [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
-    sname="{{ secret }}"; [[ -n $sname ]] || sname="$(basename '{{ justfile_directory() }}' | tr '.' '-')-{{ name }}"
+    sname="{{ secret }}"
+    if [[ -z $sname ]]; then
+      # NOT basename(justfile_directory()): inside a container the repo is mounted
+      # at an arbitrary path (/w, /workspace, /github/workspace) and the secret
+      # would silently be named after the mount point. The git remote is stable
+      # wherever the repo is checked out.
+      repo=$(git config --get remote.origin.url 2>/dev/null | sed 's#.*[/:]##; s#\.git$##')
+      [[ -n $repo ]] || repo=$(basename "$PWD")
+      sname="$(printf '%s-%s' "$repo" "{{ name }}" | tr '._' '--' | tr -cd 'a-zA-Z0-9-')"
+    fi
     # --dry-run=client: this only renders YAML, it never contacts a cluster.
     # The app container then uses `envFrom: [secretRef: {name: <sname>}]` and
     # stays distroless — it never needs sops or the age key.
     # Rendered directly rather than via `kubectl --from-env-file`, which is the
     # same dotenv format and so cannot carry a multi-line value either.
     sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} k8s "$sname"
+
+# Report whether this environment can run the env recipes, and which ones.
+# The pattern has to work on a laptop, inside a devcontainer, and on a CI runner
+# with no key — those have different tools available, so state it rather than
+# failing later with something cryptic.
+[group('env')]
+env-doctor:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    ok=0; miss=0
+    row() { # name required-for
+      if command -v "$1" >/dev/null 2>&1; then
+        printf '  ✓ %-10s %s\n' "$1" "$(command -v "$1")"; ok=$((ok+1))
+      else
+        printf '  ✗ %-10s MISSING — needed for: %s\n' "$1" "$2"; miss=$((miss+1))
+      fi
+    }
+    echo "tools:"
+    row bash       "every recipe"
+    row git        "env-check"
+    row sops       "encrypt/decrypt/edit/rekey"
+    row python3    "env-run, env-docker-run, env-k8s-secret (.just/dotenv.py)"
+    row age-keygen "env-keygen, env-whoami only"
+    row docker     "env-docker-run only"
+    row kubectl    "only to APPLY a Secret; env-k8s-secret renders YAML without it"
+
+    echo "key material:"
+    key=""
+    for p in "${SOPS_AGE_KEY_FILE:-}" \
+             "${XDG_CONFIG_HOME:-$HOME/.config}/sops/age/keys.txt" \
+             "$HOME/Library/Application Support/sops/age/keys.txt"; do
+      [[ -n $p && -f $p ]] && { key=$p; break; }
+    done
+    if [[ -n ${SOPS_AGE_KEY:-} ]]; then echo "  ✓ SOPS_AGE_KEY set in the environment"
+    elif [[ -n $key ]]; then echo "  ✓ key file $key"
+    else echo "  · no age key — read-only checks still work (this is normal in CI)"; fi
+
+    echo "context:"
+    # /.dockerenv is created by docker; cgroup matching also catches podman/k8s.
+    if [[ -f /.dockerenv ]] || grep -qaE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
+      echo "  running INSIDE a container"
+    else
+      echo "  running on a host (not containerised)"
+    fi
+    echo "  uname=$(uname -s) arch=$(uname -m)"
+    [[ -n ${IN_NIX_SHELL:-} ]] && echo "  nix devshell: $IN_NIX_SHELL" || echo "  nix devshell: no"
+
+    echo
+    if [[ $miss -eq 0 ]]; then echo "env-doctor: all tools present"; else
+      echo "env-doctor: $ok present, $miss missing — recipes needing the missing tools will fail"; fi
