@@ -1,0 +1,13 @@
+name: Apply env/dec runtime bootstrap
+
+on:
+  push:
+    branches:
+      - agent/env-dec-runtime-bootstrap-20260811
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    uses: fiducia-cloud/.github/.github/workflows/apply-fiducia-env-dec-runtime-bootstrap.yml@b4313e0ea9f85fa7467064f38556b9eade2f3f72
