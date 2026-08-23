@@ -26,9 +26,22 @@ _dec := justfile_directory() / "env" / "dec"
 _fmt := "--input-type dotenv --output-type dotenv"
 _dotenv := "python3 " + justfile_directory() / ".just" / "dotenv.py"
 
+# env/dec is runtime-only and deliberately absent from Git. Every public
+# env recipe depends on this bootstrap, including recipes that normally keep
+# plaintext in memory, so fresh clones have one filesystem contract.
+[private]
+_env-dec:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    path="{{ _dec }}"
+    [[ ! -L "$path" ]] || { echo "env/dec must not be a symlink" >&2; exit 1; }
+    [[ ! -e "$path" || -d "$path" ]] || { echo "env/dec must be a directory" >&2; exit 1; }
+    mkdir -p "$path"
+    chmod 700 "$path"
+
 # List every environment and the variable names it defines (never values).
 [group('env')]
-env-list:
+env-list: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
@@ -44,11 +57,10 @@ env-list:
 
 # Decrypt env/enc/*.env.enc into env/dec/*.env (mode 0600). No args = all.
 [group('env')]
-env-decrypt *names:
+env-decrypt *names: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
-    mkdir -p {{ _dec }} && chmod 700 {{ _dec }}
     sel=({{ names }})
     if [[ ${#sel[@]} -eq 0 ]]; then
       for f in {{ _enc }}/*.env.enc; do sel+=("$(basename "$f" .env.enc)"); done
@@ -68,7 +80,7 @@ env-decrypt *names:
 
 # Encrypt env/dec/<name>.env back into env/enc/<name>.env.enc. No args = all.
 [group('env')]
-env-encrypt *names:
+env-encrypt *names: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
@@ -103,12 +115,12 @@ env-encrypt *names:
 
 # Edit an encrypted environment in $EDITOR; plaintext never lands on disk.
 [group('env')]
-env-edit name:
+env-edit name: _env-dec
     @sops edit {{ _fmt }} {{ _enc }}/{{ name }}.env.enc
 
 # Create a new empty encrypted environment.
 [group('env')]
-env-new name:
+env-new name: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     dst={{ _enc }}/{{ name }}.env.enc
@@ -120,7 +132,7 @@ env-new name:
 
 # Run a command with <name>'s variables exported. Plaintext never hits disk.
 [group('env')]
-env-run name +cmd:
+env-run name +cmd: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
@@ -136,7 +148,7 @@ env-run name +cmd:
 
 # Show which variables differ between env/dec/*.env and the committed ciphertext.
 [group('env')]
-env-status:
+env-status: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
@@ -160,7 +172,7 @@ env-status:
 
 # Re-encrypt to match .sops.yaml after adding or removing a recipient.
 [group('env')]
-env-rekey:
+env-rekey: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
@@ -171,7 +183,7 @@ env-rekey:
 
 # Print this machine's age recipient (public key; safe to share and commit).
 [group('env')]
-env-whoami:
+env-whoami: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     for p in "${SOPS_AGE_KEY_FILE:-}" \
@@ -183,7 +195,7 @@ env-whoami:
 
 # Create this machine's age key, once. Never overwrites an existing key.
 [group('env')]
-env-keygen:
+env-keygen: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ $OSTYPE == darwin* ]]; then
@@ -204,7 +216,7 @@ env-keygen:
 
 # Fail-closed audit: no plaintext in git, gitignore intact, ciphertext valid.
 [group('env')]
-env-check:
+env-check: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ justfile_directory() }}
@@ -299,7 +311,7 @@ env-check:
 
 # Wipe decrypted plaintext from env/dec (regenerate with `just env-decrypt`).
 [group('env')]
-env-clean:
+env-clean: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     shopt -s nullglob
@@ -340,7 +352,7 @@ env-clean:
 # Everything after <name> goes to `docker run` verbatim, so flags work:
 #   just env-docker-run local -p 8080:8080 --name api ghcr.io/…/fiducia-auth:dev
 [group('docker')]
-env-docker-run name +args:
+env-docker-run name +args: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
@@ -359,12 +371,11 @@ env-docker-run name +args:
 
 # Materialise a 0600 env-file for `docker compose` (env_file:) — plaintext on disk.
 [group('docker')]
-env-docker-env-file name:
+env-docker-env-file name: _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
     [[ -f $src ]] || { echo "no such environment: {{ name }}" >&2; exit 1; }
-    mkdir -p {{ _dec }} && chmod 700 {{ _dec }}
     out={{ _dec }}/{{ name }}.env
     tmp=$(mktemp "{{ _dec }}/.{{ name }}.XXXXXX"); chmod 600 "$tmp"
     sops decrypt {{ _fmt }} "$src" | {{ _dotenv }} envfile > "$tmp"; mv -f "$tmp" "$out"
@@ -374,7 +385,7 @@ env-docker-env-file name:
 
 # Render a Kubernetes Secret from <name>. Pipe to `kubectl apply -f -` to apply.
 [group('docker')]
-env-k8s-secret name secret="":
+env-k8s-secret name secret="": _env-dec
     #!/usr/bin/env bash
     set -euo pipefail
     src={{ _enc }}/{{ name }}.env.enc
@@ -401,7 +412,7 @@ env-k8s-secret name secret="":
 # with no key — those have different tools available, so state it rather than
 # failing later with something cryptic.
 [group('env')]
-env-doctor:
+env-doctor: _env-dec
     #!/usr/bin/env bash
     set -uo pipefail
     ok=0; miss=0
