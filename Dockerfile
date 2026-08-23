@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for fiducia-load-balance. Clones sibling path
 # dependencies so Cargo resolves the same layout as local development.
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build
+FROM rust:1.97.1-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
