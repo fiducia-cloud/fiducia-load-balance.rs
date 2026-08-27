@@ -23,7 +23,7 @@ COPY . fiducia-load-balance.rs
 WORKDIR /build/fiducia-load-balance.rs
 RUN cargo build --locked --release && strip target/release/fiducia-load-balance
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build --chown=65532:65532 /build/fiducia-load-balance.rs/target/release/fiducia-load-balance /usr/local/bin/fiducia-load-balance
 EXPOSE 8088
 USER 65532:65532
