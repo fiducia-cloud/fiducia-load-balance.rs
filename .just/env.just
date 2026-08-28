@@ -33,11 +33,14 @@ _dotenv := "python3 " + justfile_directory() / ".just" / "dotenv.py"
 _env-dec:
     #!/usr/bin/env bash
     set -euo pipefail
-    path="{{ _dec }}"
-    [[ ! -L "$path" ]] || { echo "env/dec must not be a symlink" >&2; exit 1; }
-    [[ ! -e "$path" || -d "$path" ]] || { echo "env/dec must be a directory" >&2; exit 1; }
-    mkdir -p "$path"
-    chmod 700 "$path"
+    root="$(git rev-parse --show-toplevel)"
+    cd "$root"
+    for rel in env env/enc env/dec; do
+      [[ ! -L "$rel" ]] || { echo "$rel must not be a symlink" >&2; exit 1; }
+      [[ ! -e "$rel" || -d "$rel" ]] || { echo "$rel must be a directory" >&2; exit 1; }
+    done
+    command -v ores-sops >/dev/null 2>&1 || { echo "ores-sops is required to create env/dec" >&2; exit 1; }
+    ores-sops ensure-dec
 
 # List every environment and the variable names it defines (never values).
 [group('env')]
