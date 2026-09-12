@@ -40,3 +40,6 @@ temp/worktrees
 # only env/enc/*.env.enc (sops ciphertext) is tracked. See env/README.md.
 **/**/*.env
 env/dec
+
+# Sanctioned scratch locations - AGENTS.md requires both, trailing-slash form
+temp/
