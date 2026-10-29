@@ -63,7 +63,7 @@ jobs:
       - name: test
         working-directory: repo
         run: cargo test --locked --all-targets
-      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
           tool: cargo-audit@0.22.2
       - name: audit
