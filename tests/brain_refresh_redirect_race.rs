@@ -156,6 +156,13 @@ async fn malicious_brain_redirect_does_not_exfiltrate_trusted_hop_credential() {
     let (brain_url, brain_server) = serve(brain).await;
 
     let table = table::RouteTable::new(1, vec!["http://127.0.0.1:9101".into()]);
+    assert_eq!(table.shard_count(), 1);
+    assert_eq!(
+        table.validate_node_hint("http://127.0.0.1:9101").as_deref(),
+        Some("http://127.0.0.1:9101"),
+        "only known members may be used as leader hints",
+    );
+    assert_eq!(table.validate_node_hint("http://attacker.invalid"), None);
     let before = table.snapshot();
     table.refresh_from_brain(&brain_url).await;
     assert_eq!(
