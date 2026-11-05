@@ -2,13 +2,16 @@
 //! A brain response is untrusted until validated. In particular, the internal
 //! trusted-hop secret must never be replayed to a URL from a 3xx Location.
 use std::{
-    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use axum::{
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header::LOCATION},
+    http::{header::LOCATION, HeaderMap, HeaderValue, StatusCode},
     routing::get,
     Json, Router,
 };
@@ -20,17 +23,22 @@ mod routing {
 }
 mod proxy {
     pub const INTERNAL_AUTH_HEADER: &str = "x-fiducia-internal-auth";
-    pub fn internal_secret() -> Option<&'static str> { Some("private-brain-hop-secret") }
+    pub fn internal_secret() -> Option<&'static str> {
+        Some("private-brain-hop-secret")
+    }
 }
 #[path = "../src/table.rs"]
 mod table;
 
 async fn serve(app: Router) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
-        .await.expect("bind brain fixture");
+        .await
+        .expect("bind brain fixture");
     let addr = listener.local_addr().expect("fixture address");
     let task = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("brain fixture server");
+        axum::serve(listener, app)
+            .await
+            .expect("brain fixture server");
     });
     (format!("http://{addr}"), task)
 }
@@ -43,7 +51,9 @@ struct SlowBrain {
 
 async fn nodes(State(_): State<SlowBrain>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(
-        headers.get(proxy::INTERNAL_AUTH_HEADER).and_then(|v| v.to_str().ok()),
+        headers
+            .get(proxy::INTERNAL_AUTH_HEADER)
+            .and_then(|v| v.to_str().ok()),
         proxy::internal_secret(),
         "node membership lookup must authenticate to brain",
     );
@@ -57,7 +67,9 @@ async fn nodes(State(_): State<SlowBrain>, headers: HeaderMap) -> Json<Value> {
 
 async fn placement(State(state): State<SlowBrain>, headers: HeaderMap) -> Json<Value> {
     assert_eq!(
-        headers.get(proxy::INTERNAL_AUTH_HEADER).and_then(|v| v.to_str().ok()),
+        headers
+            .get(proxy::INTERNAL_AUTH_HEADER)
+            .and_then(|v| v.to_str().ok()),
         proxy::internal_secret(),
         "placement lookup must authenticate to brain",
     );
@@ -80,25 +92,33 @@ async fn leader_redirect_learned_during_brain_io_wins_over_stale_snapshot() {
         .with_state(fixture.clone());
     let (url, server) = serve(app).await;
 
-    let table = Arc::new(table::RouteTable::new(1, vec![
-        "http://127.0.0.1:9101".into(),
-        "http://127.0.0.1:9102".into(),
-    ]));
+    let table = Arc::new(table::RouteTable::new(
+        1,
+        vec![
+            "http://127.0.0.1:9101".into(),
+            "http://127.0.0.1:9102".into(),
+        ],
+    ));
     let refresh_table = table.clone();
     let refresh = tokio::spawn(async move {
         refresh_table.refresh_from_brain(&url).await;
     });
     tokio::time::timeout(Duration::from_secs(3), fixture.placement_entered.notified())
-        .await.expect("brain placement request never arrived");
+        .await
+        .expect("brain placement request never arrived");
 
     assert_eq!(
-        table.accept_leader_hint(0, "http://127.0.0.1:9102").as_deref(),
+        table
+            .accept_leader_hint(0, "http://127.0.0.1:9102")
+            .as_deref(),
         Some("http://127.0.0.1:9102"),
         "the data plane reported a newly elected leader",
     );
     fixture.release_placement.notify_one();
     tokio::time::timeout(Duration::from_secs(3), refresh)
-        .await.expect("refresh stalled").expect("refresh task failed");
+        .await
+        .expect("refresh stalled")
+        .expect("refresh task failed");
     assert_eq!(
         table.leader_for(0).as_deref(),
         Some("http://127.0.0.1:9102"),
@@ -139,10 +159,15 @@ async fn malicious_brain_redirect_does_not_exfiltrate_trusted_hop_credential() {
     let before = table.snapshot();
     table.refresh_from_brain(&brain_url).await;
     assert_eq!(
-        hits.load(Ordering::SeqCst), 0,
+        hits.load(Ordering::SeqCst),
+        0,
         "brain Location is attacker data; no HTTP request may follow it",
     );
-    assert_eq!(table.snapshot(), before, "untrusted redirect may not update routing state");
+    assert_eq!(
+        table.snapshot(),
+        before,
+        "untrusted redirect may not update routing state"
+    );
     brain_server.abort();
     attacker_server.abort();
 }
