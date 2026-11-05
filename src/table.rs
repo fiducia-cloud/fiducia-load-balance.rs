@@ -393,10 +393,7 @@ fn brain_client() -> &'static reqwest::Client {
             // Even a 307 to another domain is untrusted data, not authority.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()))
+            .unwrap_or_else(|error| panic!("refusing insecure brain client fallback: {error}"))
     })
 }
 
