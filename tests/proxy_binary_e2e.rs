@@ -32,11 +32,13 @@ struct Observation {
     scopes: Option<String>,
     authorization: Option<String>,
     cookie: Option<String>,
+    body: String,
 }
 
 #[derive(Clone)]
 struct NodeFixture {
     leader_hint: Option<String>,
+    failure_status: Option<StatusCode>,
     observations: Arc<Mutex<Vec<Observation>>>,
 }
 
@@ -52,7 +54,7 @@ async fn node_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    _body: Bytes,
+    body: Bytes,
 ) -> Response {
     state.observations.lock().expect("observations lock").push(Observation {
         method: method.to_string(),
@@ -63,7 +65,12 @@ async fn node_handler(
         scopes: header(&headers, "x-fiducia-scopes"),
         authorization: header(&headers, "authorization"),
         cookie: header(&headers, "cookie"),
+        body: String::from_utf8_lossy(&body).into_owned(),
     });
+
+    if let Some(status) = state.failure_status {
+        return (status, Json(json!({"error": "upstream_failed_after_commit"}))).into_response();
+    }
 
     if let Some(target) = &state.leader_hint {
         let mut response = (
@@ -88,6 +95,13 @@ async fn node_handler(
 async fn spawn_node(
     leader_hint: Option<String>,
 ) -> (String, Arc<Mutex<Vec<Observation>>>, JoinHandle<()>) {
+    spawn_node_with_status(leader_hint, None).await
+}
+
+async fn spawn_node_with_status(
+    leader_hint: Option<String>,
+    failure_status: Option<StatusCode>,
+) -> (String, Arc<Mutex<Vec<Observation>>>, JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind node");
@@ -96,6 +110,7 @@ async fn spawn_node(
     let server = tokio::spawn({
         let fixture = NodeFixture {
             leader_hint,
+            failure_status,
             observations: observations.clone(),
         };
         async move {
@@ -216,4 +231,91 @@ async fn verified_client_crosses_real_lb_and_follower_to_leader_without_header_s
     }
     follower_server.abort();
     leader_server.abort();
+}
+
+
+#[tokio::test]
+async fn rejected_follower_mutation_follows_verified_leader_without_losing_request_body() {
+    let (leader_url, leader_seen, leader_server) = spawn_node(None).await;
+    let (follower_url, follower_seen, follower_server) =
+        spawn_node(Some(leader_url.clone())).await;
+    let (lb_url, _lb) = launch_lb(&[&follower_url, &leader_url]);
+    await_lb(&lb_url).await;
+
+    let mutating_body = json!({
+        "key": "orders/42",
+        "holder": "worker-a",
+        "ttl_ms": 10_000,
+        "request_id": "request-e2e-mutation-a"
+    });
+    let response = reqwest::Client::new()
+        .post(format!("{lb_url}/v1/locks/acquire"))
+        .header("x-fiducia-edge-auth", INTERNAL_SECRET)
+        .header("x-fiducia-auth-kind", "api_key")
+        .header("x-fiducia-org-id", "tenant-verified")
+        .header("x-fiducia-scopes", "locks:write")
+        .header("x-fiducia-internal-auth", "client-forged-proof")
+        .header("authorization", "Bearer forged-client-key")
+        .json(&mutating_body)
+        .send()
+        .await
+        .expect("LB must retry only a verified NotLeader rejection");
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value = response.json().await.expect("leader response");
+    assert_eq!(result["committed"], true);
+
+    let follower_hits = follower_seen.lock().expect("follower observations").clone();
+    let leader_hits = leader_seen.lock().expect("leader observations").clone();
+    assert_eq!(follower_hits.len(), 1, "follower must reject exactly once");
+    assert_eq!(leader_hits.len(), 1, "leader must apply the single forwarded mutation");
+    for observed in follower_hits.iter().chain(leader_hits.iter()) {
+        assert_eq!(observed.method, "POST");
+        assert_eq!(observed.path, "/v1/locks/acquire");
+        assert_eq!(
+            serde_json::from_str::<Value>(&observed.body).expect("forwarded body JSON"),
+            mutating_body,
+            "leader retry must preserve exact mutation parameters"
+        );
+        assert_eq!(observed.org.as_deref(), Some("tenant-verified"));
+        assert_eq!(observed.scopes.as_deref(), Some("locks:write"));
+        assert_eq!(observed.internal_auth.as_deref(), Some(INTERNAL_SECRET));
+        assert!(observed.edge_auth.is_none());
+        assert!(observed.authorization.is_none());
+    }
+
+    follower_server.abort();
+    leader_server.abort();
+}
+
+#[tokio::test]
+async fn ambiguous_unmarked_mutation_failure_is_not_replayed_to_another_node() {
+    let (backup_url, backup_seen, backup_server) = spawn_node(None).await;
+    let (primary_url, primary_seen, primary_server) =
+        spawn_node_with_status(None, Some(StatusCode::SERVICE_UNAVAILABLE)).await;
+    let (lb_url, _lb) = launch_lb(&[&primary_url, &backup_url]);
+    await_lb(&lb_url).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{lb_url}/v1/locks/acquire"))
+        .header("x-fiducia-edge-auth", INTERNAL_SECRET)
+        .header("x-fiducia-auth-kind", "api_key")
+        .header("x-fiducia-org-id", "tenant-verified")
+        .header("x-fiducia-scopes", "locks:write")
+        .json(&json!({"key": "orders/42", "holder": "worker-a", "ttl_ms": 10_000}))
+        .send()
+        .await
+        .expect("LB responds to a failed mutation");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.expect("failure response");
+    assert_eq!(body["error"], "upstream_failed_after_commit");
+    let primary_hits = primary_seen.lock().expect("primary observations");
+    assert_eq!(primary_hits.len(), 1, "a possibly committed write may reach one node");
+    assert_eq!(primary_hits[0].method, "POST");
+    assert!(
+        backup_seen.lock().expect("backup observations").is_empty(),
+        "a generic 503 must not replay the mutation to another node"
+    );
+
+    primary_server.abort();
+    backup_server.abort();
 }
