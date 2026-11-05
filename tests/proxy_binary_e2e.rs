@@ -56,20 +56,28 @@ async fn node_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    state.observations.lock().expect("observations lock").push(Observation {
-        method: method.to_string(),
-        path: uri.to_string(),
-        internal_auth: header(&headers, "x-fiducia-internal-auth"),
-        edge_auth: header(&headers, "x-fiducia-edge-auth"),
-        org: header(&headers, "x-fiducia-org-id"),
-        scopes: header(&headers, "x-fiducia-scopes"),
-        authorization: header(&headers, "authorization"),
-        cookie: header(&headers, "cookie"),
-        body: String::from_utf8_lossy(&body).into_owned(),
-    });
+    state
+        .observations
+        .lock()
+        .expect("observations lock")
+        .push(Observation {
+            method: method.to_string(),
+            path: uri.to_string(),
+            internal_auth: header(&headers, "x-fiducia-internal-auth"),
+            edge_auth: header(&headers, "x-fiducia-edge-auth"),
+            org: header(&headers, "x-fiducia-org-id"),
+            scopes: header(&headers, "x-fiducia-scopes"),
+            authorization: header(&headers, "authorization"),
+            cookie: header(&headers, "cookie"),
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
 
     if let Some(status) = state.failure_status {
-        return (status, Json(json!({"error": "upstream_failed_after_commit"}))).into_response();
+        return (
+            status,
+            Json(json!({"error": "upstream_failed_after_commit"})),
+        )
+            .into_response();
     }
 
     if let Some(target) = &state.leader_hint {
@@ -82,10 +90,9 @@ async fn node_handler(
             "x-fiducia-not-leader",
             "true".parse().expect("header value"),
         );
-        response.headers_mut().insert(
-            "x-fiducia-leader",
-            target.parse().expect("leader header"),
-        );
+        response
+            .headers_mut()
+            .insert("x-fiducia-leader", target.parse().expect("leader header"));
         response
     } else {
         Json(json!({"committed": true, "source": "leader-node"})).into_response()
@@ -173,8 +180,7 @@ async fn await_lb(url: &str) {
 #[tokio::test]
 async fn verified_client_crosses_real_lb_and_follower_to_leader_without_header_spoofing() {
     let (leader_url, leader_seen, leader_server) = spawn_node(None).await;
-    let (follower_url, follower_seen, follower_server) =
-        spawn_node(Some(leader_url.clone())).await;
+    let (follower_url, follower_seen, follower_server) = spawn_node(Some(leader_url.clone())).await;
     let (lb_url, _lb) = launch_lb(&[&follower_url, &leader_url]);
     await_lb(&lb_url).await;
 
@@ -216,8 +222,16 @@ async fn verified_client_crosses_real_lb_and_follower_to_leader_without_header_s
 
     let followers = follower_seen.lock().unwrap().clone();
     let leaders = leader_seen.lock().unwrap().clone();
-    assert_eq!(followers.len(), 1, "only the initial stale route should hit follower");
-    assert_eq!(leaders.len(), 2, "both requests ultimately reach the leader");
+    assert_eq!(
+        followers.len(),
+        1,
+        "only the initial stale route should hit follower"
+    );
+    assert_eq!(
+        leaders.len(),
+        2,
+        "both requests ultimately reach the leader"
+    );
 
     for observation in followers.iter().chain(leaders.iter()) {
         assert_eq!(observation.method, "GET");
@@ -233,12 +247,10 @@ async fn verified_client_crosses_real_lb_and_follower_to_leader_without_header_s
     leader_server.abort();
 }
 
-
 #[tokio::test]
 async fn rejected_follower_mutation_follows_verified_leader_without_losing_request_body() {
     let (leader_url, leader_seen, leader_server) = spawn_node(None).await;
-    let (follower_url, follower_seen, follower_server) =
-        spawn_node(Some(leader_url.clone())).await;
+    let (follower_url, follower_seen, follower_server) = spawn_node(Some(leader_url.clone())).await;
     let (lb_url, _lb) = launch_lb(&[&follower_url, &leader_url]);
     await_lb(&lb_url).await;
 
@@ -267,7 +279,11 @@ async fn rejected_follower_mutation_follows_verified_leader_without_losing_reque
     let follower_hits = follower_seen.lock().expect("follower observations").clone();
     let leader_hits = leader_seen.lock().expect("leader observations").clone();
     assert_eq!(follower_hits.len(), 1, "follower must reject exactly once");
-    assert_eq!(leader_hits.len(), 1, "leader must apply the single forwarded mutation");
+    assert_eq!(
+        leader_hits.len(),
+        1,
+        "leader must apply the single forwarded mutation"
+    );
     for observed in follower_hits.iter().chain(leader_hits.iter()) {
         assert_eq!(observed.method, "POST");
         assert_eq!(observed.path, "/v1/locks/acquire");
@@ -309,7 +325,11 @@ async fn ambiguous_unmarked_mutation_failure_is_not_replayed_to_another_node() {
     let body: Value = response.json().await.expect("failure response");
     assert_eq!(body["error"], "upstream_failed_after_commit");
     let primary_hits = primary_seen.lock().expect("primary observations");
-    assert_eq!(primary_hits.len(), 1, "a possibly committed write may reach one node");
+    assert_eq!(
+        primary_hits.len(),
+        1,
+        "a possibly committed write may reach one node"
+    );
     assert_eq!(primary_hits[0].method, "POST");
     assert!(
         backup_seen.lock().expect("backup observations").is_empty(),
