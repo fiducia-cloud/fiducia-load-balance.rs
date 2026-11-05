@@ -389,8 +389,14 @@ fn brain_client() -> &'static reqwest::Client {
                 "FIDUCIA_BRAIN_REFRESH_TIMEOUT_SECS",
                 DEFAULT_BRAIN_REFRESH_TIMEOUT_SECS,
             ))
+            // The trusted-hop header must never follow a control-plane redirect.
+            // Even a 307 to another domain is untrusted data, not authority.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|_| reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()))
     })
 }
 
