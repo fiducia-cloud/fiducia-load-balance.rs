@@ -54,16 +54,20 @@ async fn node_handler(
     headers: HeaderMap,
     _body: Bytes,
 ) -> Response {
-    state.observations.lock().expect("observations lock").push(Observation {
-        method: method.to_string(),
-        path: uri.to_string(),
-        internal_auth: header(&headers, "x-fiducia-internal-auth"),
-        edge_auth: header(&headers, "x-fiducia-edge-auth"),
-        org: header(&headers, "x-fiducia-org-id"),
-        scopes: header(&headers, "x-fiducia-scopes"),
-        authorization: header(&headers, "authorization"),
-        cookie: header(&headers, "cookie"),
-    });
+    state
+        .observations
+        .lock()
+        .expect("observations lock")
+        .push(Observation {
+            method: method.to_string(),
+            path: uri.to_string(),
+            internal_auth: header(&headers, "x-fiducia-internal-auth"),
+            edge_auth: header(&headers, "x-fiducia-edge-auth"),
+            org: header(&headers, "x-fiducia-org-id"),
+            scopes: header(&headers, "x-fiducia-scopes"),
+            authorization: header(&headers, "authorization"),
+            cookie: header(&headers, "cookie"),
+        });
 
     if let Some(target) = &state.leader_hint {
         let mut response = (
@@ -75,10 +79,9 @@ async fn node_handler(
             "x-fiducia-not-leader",
             "true".parse().expect("header value"),
         );
-        response.headers_mut().insert(
-            "x-fiducia-leader",
-            target.parse().expect("leader header"),
-        );
+        response
+            .headers_mut()
+            .insert("x-fiducia-leader", target.parse().expect("leader header"));
         response
     } else {
         Json(json!({"committed": true, "source": "leader-node"})).into_response()
@@ -158,8 +161,7 @@ async fn await_lb(url: &str) {
 #[tokio::test]
 async fn verified_client_crosses_real_lb_and_follower_to_leader_without_header_spoofing() {
     let (leader_url, leader_seen, leader_server) = spawn_node(None).await;
-    let (follower_url, follower_seen, follower_server) =
-        spawn_node(Some(leader_url.clone())).await;
+    let (follower_url, follower_seen, follower_server) = spawn_node(Some(leader_url.clone())).await;
     let (lb_url, _lb) = launch_lb(&[&follower_url, &leader_url]);
     await_lb(&lb_url).await;
 
@@ -201,8 +203,16 @@ async fn verified_client_crosses_real_lb_and_follower_to_leader_without_header_s
 
     let followers = follower_seen.lock().unwrap().clone();
     let leaders = leader_seen.lock().unwrap().clone();
-    assert_eq!(followers.len(), 1, "only the initial stale route should hit follower");
-    assert_eq!(leaders.len(), 2, "both requests ultimately reach the leader");
+    assert_eq!(
+        followers.len(),
+        1,
+        "only the initial stale route should hit follower"
+    );
+    assert_eq!(
+        leaders.len(),
+        2,
+        "both requests ultimately reach the leader"
+    );
 
     for observation in followers.iter().chain(leaders.iter()) {
         assert_eq!(observation.method, "GET");
