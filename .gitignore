@@ -31,8 +31,6 @@ Thumbs.db
 .direnv/
 target/
 .cargo-target-*/
-tmp
-temp
 tmp/worktrees
 temp/worktrees
 
@@ -43,3 +41,20 @@ env/dec
 
 # Sanctioned scratch locations - AGENTS.md requires both, trailing-slash form
 temp/
+
+# machine-local symlink to ORESoftware/my-ai AGENTS.md; never committed
+.ores/
+
+# ORESoftware SOPS dotenv ignore contract (ORESoftware/.github docs/sops-environment-standard.md)
+*.env
+*/*.env
+*/**/*.env
+.env.*
+*.env.*
+!.env.example
+
+/env/dec/
+
+/env/enc/*
+!/env/enc/dev.env.enc
+!/env/enc/prod.env.enc
